@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+
+  <!-- PWA / Home Screen -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="NFL Parlay">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#060610">
+  <meta name="application-name" content="NFL Parlay Model">
+  <meta name="description" content="17-signal NFL parlay predictor with Monte Carlo, self-learning, and EV calculator">
+
+  <title>NFL Parlay Model</title>
+
+  <!-- PWA Manifest -->
+  <link rel="manifest" href="manifest.json">
+
+  <!-- Apple touch icons (iOS home screen) -->
+  <link rel="apple-touch-icon" sizes="192x192" href="icon-192.png">
+  <link rel="apple-touch-icon" sizes="512x512" href="icon-512.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+
+  <!-- React 18 + ReactDOM from CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone for JSX transformation in-browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #060610; overflow-x: hidden; }
+    #root { height: 100%; }
+    /* Splash screen while loading */
+    #splash {
+      position: fixed; inset: 0; z-index: 9999;
+      background: #060610;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px;
+    }
+    #splash .icon {
+      font-size: 52px; animation: pulse 1.5s ease-in-out infinite;
+    }
+    #splash .label {
+      font-family: system-ui, sans-serif;
+      font-size: 11px; font-weight: 700;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      color: rgba(251,191,36,0.7);
+    }
+    #splash .bar-wrap {
+      width: 160px; height: 3px; background: rgba(255,255,255,0.08); border-radius: 2px;
+    }
+    #splash .bar {
+      height: 100%; background: #fbbf24; border-radius: 2px;
+      animation: load 2.5s ease-in-out forwards;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    @keyframes load  { from{width:0%} to{width:100%} }
+  </style>
+</head>
+<body>
+
+  <!-- Splash shown while React/Babel loads -->
+  <div id="splash">
+    <div class="icon">🏈</div>
+    <div class="label">NFL Parlay Model</div>
+    <div class="bar-wrap"><div class="bar"></div></div>
+  </div>
+
+  <div id="root"></div>
+
+  <script>
+    // ── window.storage: maps Claude artifact storage API → localStorage ──────
+    // The model was built using window.storage. This shim makes it work
+    // identically when deployed as a standalone PWA.
+    window.storage = {
+      async get(key, shared) {
+        try {
+          const v = localStorage.getItem('nflparlay_' + key);
+          return v != null ? { key, value: v, shared: !!shared } : null;
+        } catch(e) { console.error('storage.get', e); return null; }
+      },
+      async set(key, value, shared) {
+        try {
+          localStorage.setItem('nflparlay_' + key, value);
+          return { key, value, shared: !!shared };
+        } catch(e) { console.error('storage.set', e); return null; }
+      },
+      async delete(key, shared) {
+        try {
+          localStorage.removeItem('nflparlay_' + key);
+          return { key, deleted: true, shared: !!shared };
+        } catch(e) { console.error('storage.delete', e); return null; }
+      },
+      async list(prefix, shared) {
+        try {
+          const p = 'nflparlay_' + (prefix || '');
+          const keys = Object.keys(localStorage)
+            .filter(k => k.startsWith(p))
+            .map(k => k.slice('nflparlay_'.length));
+          return { keys, prefix, shared: !!shared };
+        } catch(e) { console.error('storage.list', e); return [] ; }
+      }
+    };
+
+    // ── Register service worker ───────────────────────────────────────────────
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+          .then(reg => console.log('[SW] registered', reg.scope))
+          .catch(err => console.warn('[SW] failed', err));
+      });
+    }
+  </script>
+
+  <!-- Load and transform the JSX with Babel, then mount React ───────────── -->
+  <script>
+    (async function() {
+      try {
+        const res  = await fetch('./nfl-predictor.jsx');
+        const jsx  = await res.text();
+
+        // Prepare the code for browser execution:
+        //  1. Replace ES import with destructuring from global React
+        //  2. Replace `export default function` with a global assignment
+        const code = jsx
+          .replace(
+            /^import\s+\{[^}]+\}\s+from\s+["']react["'];?\s*/m,
+            'const { useState, useEffect, useRef, useCallback } = React;\n'
+          )
+          .replace(
+            /^export default function (\w+)/m,
+            'window.$1 = function $1'
+          );
+
+        const { code: compiled } = Babel.transform(code, {
+          presets: ['react'],
+          filename: 'nfl-predictor.jsx'
+        });
+
+        // eslint-disable-next-line no-new-func
+        new Function(compiled)();
+
+        // Mount
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(window.NFLParlayModel));
+
+        // Hide splash once React has painted
+        requestAnimationFrame(() => {
+          const splash = document.getElementById('splash');
+          if (splash) {
+            splash.style.transition = 'opacity 0.4s ease';
+            splash.style.opacity   = '0';
+            setTimeout(() => splash.remove(), 450);
+          }
+        });
+      } catch(err) {
+        console.error('Failed to load model:', err);
+        document.getElementById('splash').innerHTML =
+          `<div style="color:#f87171;font-family:sans-serif;text-align:center;padding:20px">
+            <div style="font-size:32px;margin-bottom:12px">⚠️</div>
+            <div style="font-size:14px;margin-bottom:8px">Failed to load model</div>
+            <div style="font-size:11px;opacity:0.6">${err.message}</div>
+          </div>`;
+      }
+    })();
+  </script>
+
+</body>
+</html>
