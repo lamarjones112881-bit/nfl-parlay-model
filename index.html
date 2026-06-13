@@ -73,6 +73,14 @@
   <div id="root"></div>
 
   <script>
+    // ── Proxy flag — tells callClaude() to route through /api/claude ──────────
+    // This keeps ANTHROPIC_API_KEY server-side and invisible to the browser.
+    window.__USE_PROXY = true;
+
+    // ── Optional: app token matching Vercel APP_TOKEN env var ─────────────────
+    // Uncomment and set the same value you used in Vercel to add a second lock:
+    // window.__APP_TOKEN = "replace-with-your-app-token";
+
     // ── window.storage: maps Claude artifact storage API → localStorage ──────
     // The model was built using window.storage. This shim makes it work
     // identically when deployed as a standalone PWA.
