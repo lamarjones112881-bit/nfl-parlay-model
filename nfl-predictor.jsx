@@ -7680,7 +7680,7 @@ RISK: LOW=65%+ all signals aligned sharp no luck no garbage contamination OL hea
   async function analyzeParlayLegs(){
     if(parlayLegs.length<2)return;
     setAnalyzingParlay(true);setParlayAnalysis(null);
-    const legStr=parlayLegs.map((l,i)=>"Leg "+(i+1)+": "+l.awayTeam+" @ "+l.homeTeam+" — "+l.betType+": "+l.pick+" ("+l.winProb+"%, "+l.risk+""+l.rlm?" RLM":""+""+l.cpoeEdge?" CPOE-EDGE":""+""+l.coachEdge?" COACH-EDGE":""+""+l.luckRegressed?" LUCK-REGRESSED":""+""+l.keyNumFlag?" KEY#${l.keyNumFlag.kn}`:""}${l.divisional?" DIV":""}${l.homedog?" HOMEDOG":""})`).join("\n");
+    const legStr=parlayLegs.map((l,i)=>"Leg "+(i+1)+": "+l.awayTeam+" @ "+l.homeTeam+" | "+l.betType+": "+l.pick+" ("+l.winProb+"%, "+l.risk+")"+(l.rlm?" RLM":"")+(l.cpoeEdge?" CPOE-EDGE":"")+(l.coachEdge?" COACH-EDGE":"")+(l.luckRegressed?" LUCK-REGRESSED":"")+(l.keyNumFlag?" KEY#"+l.keyNumFlag.kn:"")+(l.divisional?" DIV":"")+(l.homedog?" HOMEDOG":"")).join("\n");
     const combProb=parlayLegs.reduce((a,l)=>a*(l.winProb||55)/100,1)*100;
     try{
       const text=await callClaude({useSearch:true,maxTokens:1100,prompt:`Elite parlay analyst. ${parlayLegs.length}-leg parlay. Real money. Brutal.
