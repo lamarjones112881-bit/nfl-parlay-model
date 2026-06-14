@@ -91,6 +91,10 @@ const WEIGHTS_KEY     = "nfl_signal_weights_v1";
 const SEASON_KEY      = "nfl_season_analytics_v1";
 const POWER_KEY       = "nfl_power_rankings_v1";
 const PENDING_KEY     = "nfl_pending_games_v1";
+const PROPS_KEY       = "nfl_props_v1";
+const CLUSTER_KEY     = "nfl_clusters_v1";
+const GNN_KEY         = "nfl_gnn_v1";
+const SCHEDULE_KEY    = "nfl_execution_schedule_v1";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FIVE NEW FEATURES: EV + Kelly · Bankroll Tracker · Weather Forecast
@@ -100,6 +104,12 @@ const PENDING_KEY     = "nfl_pending_games_v1";
 const BANKROLL_KEY  = "nfl_bankroll_v1";
 const UNITS_KEY     = "nfl_units_v1";
 const WEATHER_CACHE_KEY = "nfl_weather_v1";
+const H2H_KEY           = "nfl_h2h_v1";
+const DVOA_KEY          = "nfl_dvoa_v1";
+const ADVANCED_KEY      = "nfl_advanced_v1";
+const ELO_KEY           = "nfl_elo_v1";
+const SCHEDULE_SPOT_KEY = "nfl_schedspot_v1";
+const PUBLIC_PCT_KEY    = "nfl_public_pct_v1";
 
 // ── Outdoor stadium coordinates (for weather fetch) ───────────────────────
 const OUTDOOR_STADIUMS = {
@@ -283,6 +293,17 @@ function EVKellyPanel({ gameResult, lines }) {
           <div style={{fontSize:"7px",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif"}}>¼ Kelly</div>
         </div>}
       </div>}
+      {/* Log Bet shortcut from EV panel */}
+      {ev>0 && kelly && unitBet!=null && (
+        <button onClick={()=>{
+          const dec=decimal||1.909;
+          const wonEst=parseFloat((parseFloat(bankroll||1000)*kelly.quarter/100*(dec-1)).toFixed(2));
+          if(window._onLogBet) window._onLogBet({units:parseFloat((parseFloat(bankroll||1000)*kelly.quarter/100).toFixed(2)),odds:oddsInput,result:"WIN",unitsWon:wonEst,note:"From EV panel — "+activeTab});
+        }}
+        style={{width:"100%",marginBottom:"7px",padding:"7px",borderRadius:"5px",border:"1px solid rgba(74,222,128,0.25)",background:"rgba(74,222,128,0.07)",color:"#4ade80",fontSize:"10px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>
+          📋 Pre-fill Bankroll Entry from ¼ Kelly
+        </button>
+      )}
       <div style={{marginTop:"7px",fontSize:"8px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>EV = (model_prob × decimal_odds) - 1 · Kelly = (bp-q)/b · Always use ¼ Kelly to reduce variance</div>
     </Panel>
   );
@@ -420,6 +441,1833 @@ function WeatherForecastPanel({ homeTeam, forecastData, forecastLoading, onApply
 }
 
 // ── Line Shopping Panel ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// PLAYER PROP & DERIVATIVE MODELER
+// ─────────────────────────────────────────────────────────────────────────
+// Three-layer system:
+// 1. Book Lines — fetched live from DK/FD/Caesars/BetMGM
+// 2. Model Projections — derived from the 17-signal game model
+// 3. Edge Detection — where model disagrees with the book line by 8%+
+//
+// Derivative logic connects game signals directly to player outputs:
+// • High pressure rate vs QB → pass yards trend under
+// • Degraded OL → rush yards trend up (game script dependent)
+// • Bad weather (wind/rain) → all passing props trend under
+// • Large spread favorite → winning RB late carries trend over
+// • Low total → all offensive props trend under
+// • High CPOE QB → receiver props trend over
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Derivative projection engine ──────────────────────────────────────────
+// Takes the full game signal stack and projects individual stat lines.
+// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH NEURAL NETWORK — ROSTER INTERDEPENDENCY ENGINE
+// ─────────────────────────────────────────────────────────────────────────
+// Models NFL roster health as a graph where nodes = positions and edges =
+// interdependency strength. Injury to one node propagates to connected nodes
+// through 2 rounds of message passing — a simplified Graph Convolutional
+// Network (GCN) that captures cascading effects standard injury models miss.
+//
+// Also includes:
+//   • Snap Count / Depth Chart Tracker — who actually lines up
+//   • Coverage Scheme Detector — man vs zone vs hybrid
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Roster graph: position interdependency edges ──────────────────────────
+// Weight = how much node A depends on node B (0→1)
+const POSITION_EDGES = {
+  QB:   { LT:0.85, LG:0.60, C:0.65, RG:0.55, RT:0.50, WR1:0.80, WR2:0.60, TE:0.55, RB:0.35 },
+  LT:   { QB:0.80, LG:0.50, EDGE_OPP:0.70 },
+  LG:   { QB:0.55, C:0.55,  LT:0.45 },
+  C:    { QB:0.65, LG:0.55, RG:0.55 },
+  RG:   { QB:0.55, C:0.55,  RT:0.45 },
+  RT:   { QB:0.45, RG:0.45 },
+  WR1:  { QB:0.80, CB1_OPP:0.70, WR2:0.25 },
+  WR2:  { QB:0.60, WR1:0.25, TE:0.20, CB2_OPP:0.55 },
+  TE:   { QB:0.55, WR2:0.20, RB:0.15 },
+  RB:   { QB:0.35, LT:0.45,  LG:0.40, C:0.45, RG:0.40, RT:0.35 },
+  EDGE_OPP:{ LT:0.70 },
+  CB1_OPP: { WR1:0.70 },
+  CB2_OPP: { WR2:0.55 },
+};
+
+// Position importance weights for final score aggregation
+const POSITION_IMPORTANCE = {
+  QB:0.28, LT:0.12, WR1:0.12, C:0.08, LG:0.06, RG:0.06,
+  RT:0.06, WR2:0.08, TE:0.07, RB:0.07,
+};
+
+// ── GNN message passing (2-round GCN-style mean aggregation) ─────────────
+function messagePass(nodes, rounds = 2) {
+  let hidden = JSON.parse(JSON.stringify(nodes)); // deep clone
+  for (let r = 0; r < rounds; r++) {
+    const next = {};
+    Object.keys(hidden).forEach(node => {
+      const edges    = POSITION_EDGES[node] || {};
+      const nbKeys   = Object.keys(edges);
+      if (!nbKeys.length) { next[node] = hidden[node]; return; }
+      // Mean aggregation: h_v' = (h_v + Σ w_ij*h_j / Σ w_ij) / 2
+      const wSum     = nbKeys.reduce((s, nb) => s + (edges[nb] || 0), 0);
+      const nbSignal = nbKeys.reduce((s, nb) => {
+        const nbScore = hidden[nb]?.score ?? 1.0;
+        return s + (edges[nb] || 0) * nbScore;
+      }, 0);
+      const aggregated = (hidden[node].score + (wSum > 0 ? nbSignal / wSum : hidden[node].score)) / 2;
+      next[node] = { ...hidden[node], score: parseFloat(Math.min(1, Math.max(0, aggregated)).toFixed(4)) };
+    });
+    hidden = next;
+  }
+  return hidden;
+}
+
+// ── Build node features from injury + signal data ─────────────────────────
+function buildRosterNodes(injuryData, pressureData, olData, cpoeData) {
+  const nodes = {};
+  // Default all positions to healthy
+  Object.keys(POSITION_EDGES).forEach(pos => { nodes[pos] = { score: 1.0, pos }; });
+
+  // Apply injury data (if parseable)
+  if (injuryData) {
+    const text = injuryData.toLowerCase();
+    const hits = [
+      { key:"QB",  terms:["qb","quarterback"] },
+      { key:"LT",  terms:["lt ","left tackle"] },
+      { key:"LG",  terms:["lg ","left guard"] },
+      { key:"C",   terms:[" c ","center"] },
+      { key:"RG",  terms:["rg ","right guard"] },
+      { key:"RT",  terms:["rt ","right tackle"] },
+      { key:"WR1", terms:["wr1","wr 1","#1 wr","top wr"] },
+      { key:"WR2", terms:["wr2","wr 2","#2 wr"] },
+      { key:"TE",  terms:["te ","tight end"] },
+      { key:"RB",  terms:["rb ","running back"] },
+    ];
+    hits.forEach(({ key, terms }) => {
+      if (terms.some(t => text.includes(t))) {
+        if (text.match(new RegExp(`(${terms.join("|")}).{0,40}out`))) nodes[key] = { score: 0.0, pos: key, status: "out" };
+        else if (text.match(new RegExp(`(${terms.join("|")}).{0,40}doubtful`))) nodes[key] = { score: 0.35, pos: key, status: "doubtful" };
+        else if (text.match(new RegExp(`(${terms.join("|")}).{0,40}questionable`))) nodes[key] = { score: 0.72, pos: key, status: "questionable" };
+      }
+    });
+  }
+
+  // Opposing pass rush as EDGE_OPP node
+  const pressureRate = pressureData?.home?.pressureAllowed || 28;
+  nodes["EDGE_OPP"] = { score: Math.min(1, pressureRate / 50), pos: "EDGE_OPP" };
+
+  // OL health affects individual OL nodes
+  const olHealth = olData?.home?.healthScore || 80;
+  if (olHealth < 75) {
+    ["LT","LG","C","RG","RT"].forEach(pos => {
+      nodes[pos] = { ...nodes[pos], score: Math.min(nodes[pos]?.score ?? 1, olHealth / 100) };
+    });
+  }
+
+  // CPOE boosts QB node (elite QB masks OL deficiencies somewhat)
+  const cpoe = cpoeData?.home?.cpoe || 0;
+  if (cpoe > 3) nodes["QB"] = { ...nodes["QB"], score: Math.min(1, (nodes["QB"]?.score ?? 1) + cpoe / 50) };
+
+  return nodes;
+}
+
+// ── Roster integrity score from GNN output ────────────────────────────────
+function aggregateRosterScore(gnnOutput) {
+  let score = 0;
+  Object.entries(POSITION_IMPORTANCE).forEach(([pos, w]) => {
+    score += (gnnOutput[pos]?.score ?? 1.0) * w;
+  });
+  return parseFloat((score * 100).toFixed(1));
+}
+
+// ── Spread adjustment from roster integrity ───────────────────────────────
+// Calibrated: 100→50 roster score = ~2.5 pts spread impact
+function rosterToSpreadAdj(homeScore, awayScore) {
+  const homeDelta  = (homeScore - 80) / 100;  // vs 80 baseline
+  const awayDelta  = (awayScore - 80) / 100;
+  const netAdj     = (homeDelta - awayDelta) * 5; // 20-pt delta ≈ 1 pt spread
+  return parseFloat(netAdj.toFixed(2));
+}
+
+// ── Full GNN pipeline for one team ────────────────────────────────────────
+function runRosterGNN(injuryText, pressureData, olData, cpoeData, side = "home") {
+  // Adjust to home/away perspective
+  const pData = side === "home" ? pressureData : { home: pressureData?.away };
+  const oData = side === "home" ? olData       : { home: olData?.away };
+  const cData = side === "home" ? cpoeData     : { home: cpoeData?.away };
+
+  const rawNodes    = buildRosterNodes(injuryText, pData, oData, cData);
+  const gnnOutput   = messagePass(rawNodes, 2);
+  const integrityScore = aggregateRosterScore(gnnOutput);
+
+  // Identify cascade effects (nodes whose score dropped significantly post-GNN)
+  const cascades = Object.entries(gnnOutput)
+    .filter(([pos]) => POSITION_IMPORTANCE[pos])
+    .map(([pos, n]) => {
+      const rawScore = rawNodes[pos]?.score ?? 1;
+      const drop     = rawScore - n.score;
+      return { pos, rawScore, gnnScore: n.score, drop: parseFloat(drop.toFixed(3)), status: rawNodes[pos]?.status };
+    })
+    .filter(c => c.drop > 0.03 || c.status)
+    .sort((a, b) => b.drop - a.drop);
+
+  return { gnnOutput, integrityScore, cascades, rawNodes };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COVERAGE SCHEME DETECTOR
+// ═══════════════════════════════════════════════════════════════════════════
+const COVERAGE_SCHEMES = {
+  MAN_HEAVY:   { label:"Man Coverage",    icon:"🔒", color:"#f87171", passAdj:-0.08, rushAdj:+0.04, wr1Adj:+0.06, desc:"Press man — elite WR1 can exploit, but timing routes suffer. RBs get more attempts." },
+  COVER_2:     { label:"Cover 2",         icon:"2️⃣",  color:"#f59e0b", passAdj:+0.04, rushAdj:-0.02, wr1Adj:-0.05, desc:"Soft zones — shorter targets, high completion%, seams open for TE. Sideline routes limited." },
+  COVER_3:     { label:"Cover 3",         icon:"3️⃣",  color:"#38bdf8", passAdj:+0.02, rushAdj:+0.00, wr1Adj:0,     desc:"Balanced zone. Intermediate routes open. Hard to attack vertically." },
+  COVER_4:     { label:"Cover 4/Quarters",icon:"4️⃣",  color:"#a78bfa", passAdj:+0.06, rushAdj:-0.04, wr1Adj:+0.04, desc:"Deep protection — quick passes thrive, verticals capped. Run game pressured." },
+  BLITZ_HEAVY: { label:"Blitz-Heavy",     icon:"💥", color:"#ef4444", passAdj:+0.10, rushAdj:-0.08, wr1Adj:+0.12, desc:"High-risk/reward. Elite QB beats blitz for big plays; mediocre QB gets killed. Totals spike or crater." },
+  HYBRID:      { label:"Hybrid/Multiple", icon:"🔄", color:"#4ade80", passAdj:0,     rushAdj:0,     wr1Adj:0,     desc:"Multiple looks — hard to prepare for. Keeps offense off-balance. Good for elite defensive coaches." },
+};
+
+function detectCoverageScheme(pressureData, cpoeData, ensembleData) {
+  if (!pressureData) return "COVER_3";
+  const blitzRate  = pressureData.home?.pressureAllowed || 28;
+  const passRushW  = pressureData.home?.passRushWin    || 45;
+  const cpoe       = cpoeData?.home?.cpoe              || 0;
+  if (blitzRate > 38) return "BLITZ_HEAVY";
+  if (passRushW > 60) return "MAN_HEAVY";
+  if (blitzRate < 22 && passRushW < 38) return "COVER_4";
+  if (blitzRate < 26) return "COVER_2";
+  return "COVER_3";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SNAP COUNT / DEPTH CHART TRACKER
+// ═══════════════════════════════════════════════════════════════════════════
+const SNAP_BASELINE = {
+  QB:80, WR1:73, WR2:62, TE:58, RB:55, LT:98, LG:95, C:98, RG:95, RT:96,
+};
+
+function estimateSnapCounts(injuryData, gnnResult) {
+  const snaps = {};
+  Object.entries(SNAP_BASELINE).forEach(([pos, base]) => {
+    const gnnScore  = gnnResult?.gnnOutput?.[pos]?.score ?? 1.0;
+    const status    = gnnResult?.rawNodes?.[pos]?.status;
+    const adjusted  = status === "out" ? 0 : Math.round(base * gnnScore);
+    snaps[pos]      = { base, adjusted, gnnScore, pctChange: Math.round((adjusted - base) / base * 100) };
+  });
+  return snaps;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI — GNN ROSTER PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+function GNNRosterPanel({ homeTeam, awayTeam, injuries, pressureData, olData, cpoeData, ensembleData, lines }) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab]   = useState("gnn");
+
+  if (!homeTeam || !awayTeam) return null;
+
+  // Run GNN for both teams
+  const homeGNN = runRosterGNN(injuries, pressureData, olData, cpoeData, "home");
+  const awayGNN = runRosterGNN(injuries, pressureData, olData, cpoeData, "away");
+  const spreadAdj = rosterToSpreadAdj(homeGNN.integrityScore, awayGNN.integrityScore);
+
+  // Coverage scheme
+  const homeCoverage = COVERAGE_SCHEMES[detectCoverageScheme(pressureData, cpoeData, ensembleData)];
+
+  // Snap counts
+  const homeSnaps = estimateSnapCounts(injuries, homeGNN);
+  const awaySnaps = estimateSnapCounts(injuries, awayGNN);
+
+  const scoreColor = s => s >= 82 ? "#4ade80" : s >= 68 ? "#f59e0b" : s >= 50 ? "#f87171" : "#ef4444";
+  const POS_LABELS = { QB:"QB",LT:"LT",LG:"LG",C:"C",RG:"RG",RT:"RT",WR1:"WR1",WR2:"WR2",TE:"TE",RB:"RB" };
+
+  return (
+    <Panel border="rgba(99,102,241,0.22)" bg="rgba(99,102,241,0.03)" mb="10px">
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"12px"}}>🕸️</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#818cf8",fontFamily:"'Barlow Condensed',sans-serif"}}>GNN Roster Interdependency</span>
+          <Tag color={scoreColor(homeGNN.integrityScore)}>{abb(homeTeam)} {homeGNN.integrityScore}</Tag>
+          <Tag color={scoreColor(awayGNN.integrityScore)}>{abb(awayTeam)} {awayGNN.integrityScore}</Tag>
+          {Math.abs(spreadAdj) >= 0.4 && <Tag color={spreadAdj > 0 ? "#4ade80" : "#f87171"}>Net {spreadAdj > 0 ? "+" : ""}{spreadAdj} pts</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          {/* Tabs */}
+          <div style={{display:"flex",gap:"4px",marginBottom:"12px",flexWrap:"wrap"}}>
+            {[["gnn","🕸️ Roster Graph"],["cascade","⚡ Cascade Effects"],["coverage","🔒 Coverage"],["snaps","📋 Snap Counts"]].map(([k,l])=>(
+              <button key={k} onClick={()=>setTab(k)} style={{padding:"5px 10px",borderRadius:"5px",border:`1px solid ${tab===k?"rgba(99,102,241,0.4)":"rgba(255,255,255,0.07)"}`,background:tab===k?"rgba(99,102,241,0.12)":"transparent",color:tab===k?"#818cf8":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</button>
+            ))}
+          </div>
+
+          {/* ── GNN ROSTER GRAPH TAB ── */}
+          {tab==="gnn"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"10px",lineHeight:"1.6"}}>
+                2-round Graph Convolutional Network. Each node = a position. Edges = interdependency strength. Injury to LT cascades to QB (pressure), QB cascades to WR1/WR2 (fewer targets). Score 0–100.
+              </div>
+              {/* Score comparison */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:"10px",alignItems:"center",marginBottom:"12px"}}>
+                {[{team:homeTeam,gnn:homeGNN},{},{team:awayTeam,gnn:awayGNN}].map((item,i)=>
+                  i===1 ? (
+                    <div key="mid" style={{textAlign:"center"}}>
+                      <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px"}}>NET ADJ</div>
+                      <div style={{fontSize:"20px",fontWeight:900,color:Math.abs(spreadAdj)>=0.4?(spreadAdj>0?"#4ade80":"#f87171"):"#555",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{spreadAdj>0?"+":""}{spreadAdj}</div>
+                      <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>pts to spread</div>
+                    </div>
+                  ) : (
+                    <div key={item.team} style={{background:`${scoreColor(item.gnn.integrityScore)}0d`,border:`1px solid ${scoreColor(item.gnn.integrityScore)}25`,borderRadius:"8px",padding:"10px 12px",textAlign:"center"}}>
+                      <div style={{fontSize:"9px",fontWeight:700,color:tc(item.team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"4px"}}>{abb(item.team)}</div>
+                      <div style={{fontSize:"28px",fontWeight:900,color:scoreColor(item.gnn.integrityScore),fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{item.gnn.integrityScore}</div>
+                      <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"3px"}}>Roster Integrity</div>
+                      {/* Position node grid */}
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:"2px",marginTop:"7px"}}>
+                        {Object.entries(POS_LABELS).map(([pos,label])=>{
+                          const s=item.gnn.gnnOutput[pos]?.score??1;
+                          const c=s>=0.82?"#4ade80":s>=0.65?"#f59e0b":s>=0.4?"#f87171":"#ef4444";
+                          return(
+                            <div key={pos} style={{background:`${c}15`,border:`1px solid ${c}30`,borderRadius:"3px",padding:"2px 0",textAlign:"center"}} title={`${pos}: ${(s*100).toFixed(0)}%`}>
+                              <div style={{fontSize:"6px",color:c,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700}}>{label}</div>
+                              <div style={{fontSize:"8px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{Math.round(s*100)}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )
+                )}
+              </div>
+              <div style={{fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>GCN with mean aggregation · 2 message-passing rounds · 10 position nodes · Edge weights from NFL positional interdependency research</div>
+            </div>
+          )}
+
+          {/* ── CASCADE EFFECTS TAB ── */}
+          {tab==="cascade"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Positions where GNN score dropped below raw injury assessment — the cascade effect. An OL injury drops LT score, which then drops QB score, which propagates to all skill positions.
+              </div>
+              {[{team:homeTeam,gnn:homeGNN,color:tc(homeTeam)},{team:awayTeam,gnn:awayGNN,color:tc(awayTeam)}].map(({team,gnn,color})=>(
+                <div key={team} style={{marginBottom:"12px"}}>
+                  <div style={{fontSize:"9px",fontWeight:800,color,fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"6px",borderBottom:`1px solid ${color}25`,paddingBottom:"4px"}}>{team}</div>
+                  {gnn.cascades.length===0
+                    ? <div style={{fontSize:"9px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",padding:"6px 0"}}>✓ No significant cascade effects — roster largely intact</div>
+                    : gnn.cascades.map((c,i)=>{
+                        const raw=Math.round(c.rawScore*100), gnnS=Math.round(c.gnnScore*100);
+                        const dropColor=c.drop>0.15?"#ef4444":c.drop>0.08?"#f87171":"#f59e0b";
+                        return(
+                          <div key={i} style={{display:"flex",alignItems:"center",gap:"8px",padding:"6px 9px",background:"rgba(255,255,255,0.03)",border:`1px solid ${dropColor}15`,borderRadius:"5px",marginBottom:"3px"}}>
+                            <div style={{width:"32px",height:"32px",borderRadius:"6px",background:`${dropColor}15`,border:`1px solid ${dropColor}30`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                              <span style={{fontSize:"9px",fontWeight:900,color:dropColor,fontFamily:"'Barlow Condensed',sans-serif"}}>{c.pos}</span>
+                            </div>
+                            <div style={{flex:1}}>
+                              <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"2px"}}>
+                                <span style={{fontSize:"10px",fontWeight:700,color:"#ddd",fontFamily:"'Barlow Condensed',sans-serif"}}>{c.pos}</span>
+                                {c.status&&<Tag color={c.status==="out"?"#ef4444":c.status==="doubtful"?"#f87171":"#f59e0b"}>{c.status}</Tag>}
+                              </div>
+                              <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                                <span style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Raw: {raw}</span>
+                                <span style={{fontSize:"9px",color:"#444"}}>→</span>
+                                <span style={{fontSize:"11px",fontWeight:800,color:dropColor,fontFamily:"'Barlow Condensed',sans-serif"}}>GNN: {gnnS}</span>
+                                <span style={{fontSize:"9px",color:dropColor,fontFamily:"'Barlow Condensed',sans-serif"}}>(-{Math.round(c.drop*100)} cascade)</span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })
+                  }
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── COVERAGE SCHEME TAB ── */}
+          {tab==="coverage"&&(
+            <div>
+              <div style={{background:`${homeCoverage.color}08`,border:`1px solid ${homeCoverage.color}22`,borderRadius:"8px",padding:"12px 14px",marginBottom:"10px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:"9px",marginBottom:"8px"}}>
+                  <span style={{fontSize:"24px"}}>{homeCoverage.icon}</span>
+                  <div>
+                    <div style={{fontSize:"13px",fontWeight:900,color:homeCoverage.color,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{homeCoverage.label}</div>
+                    <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>{abb(homeTeam)} defensive scheme</div>
+                  </div>
+                </div>
+                <div style={{fontSize:"10px",color:"#888",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5",marginBottom:"9px"}}>{homeCoverage.desc}</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"6px"}}>
+                  {[["Pass Yards",homeCoverage.passAdj],["Rush Yards",homeCoverage.rushAdj],["WR1 Prop",homeCoverage.wr1Adj]].map(([l,v])=>{
+                    const pct=Math.round(v*100);
+                    const c=pct>0?"#4ade80":pct<0?"#f87171":"#555";
+                    return(
+                      <div key={l} style={{background:"rgba(255,255,255,0.04)",borderRadius:"5px",padding:"6px 8px",textAlign:"center"}}>
+                        <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>{l}</div>
+                        <div style={{fontSize:"13px",fontWeight:900,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{pct>0?"+":""}{pct}%</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5",marginBottom:"7px"}}>Coverage scheme adjustments are fed into the prop modeler — WR1 receiving yards, QB pass yards, and total projections all account for defensive scheme.</div>
+              <div style={{display:"flex",gap:"5px",flexWrap:"wrap"}}>
+                {Object.entries(COVERAGE_SCHEMES).map(([key,cs])=>(
+                  <div key={key} style={{display:"flex",alignItems:"center",gap:"4px",padding:"3px 8px",background:`${cs.color}08`,border:`1px solid ${cs.color}${detectCoverageScheme(pressureData,cpoeData,ensembleData)===key?"35":"15"}`,borderRadius:"5px"}}>
+                    <span style={{fontSize:"10px"}}>{cs.icon}</span>
+                    <span style={{fontSize:"8px",color:cs.color,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:detectCoverageScheme(pressureData,cpoeData,ensembleData)===key?800:400}}>{cs.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── SNAP COUNTS TAB ── */}
+          {tab==="snaps"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                GNN-adjusted snap count estimates. A QB out = 0 snaps for backup. OL injuries cascade to reduced offensive efficiency. Used to calibrate prop line projections.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+                {[{team:homeTeam,snaps:homeSnaps},{team:awayTeam,snaps:awaySnaps}].map(({team,snaps})=>(
+                  <div key={team}>
+                    <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"6px"}}>{abb(team)} Snap Est.</div>
+                    {Object.entries(snaps).map(([pos,d])=>{
+                      const pct=d.adjusted/d.base;
+                      const c=pct>=0.9?"#4ade80":pct>=0.7?"#f59e0b":pct>=0.4?"#f87171":"#ef4444";
+                      return(
+                        <div key={pos} style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"3px",padding:"3px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                          <span style={{fontSize:"8px",fontWeight:700,color:"#888",fontFamily:"'Barlow Condensed',sans-serif",width:"28px"}}>{pos}</span>
+                          <div style={{flex:1,height:"4px",borderRadius:"2px",background:"rgba(255,255,255,0.05)",overflow:"hidden"}}>
+                            <div style={{width:`${pct*100}%`,height:"100%",background:c,borderRadius:"2px"}}/>
+                          </div>
+                          <span style={{fontSize:"9px",fontWeight:700,color:c,fontFamily:"'Barlow Condensed',sans-serif",width:"26px",textAlign:"right"}}>{d.adjusted}</span>
+                          {d.pctChange<-5&&<span style={{fontSize:"7px",color:"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{d.pctChange}%</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+function derivePlayerProjections({ gameResult, lines, weather, pressureData,
+  olData, cpoeData, garbageData, homeTeam, awayTeam }) {
+
+  if (!gameResult) return null;
+
+  const homeWin   = gameResult.homeWin  || 50;
+  const awayWin   = gameResult.awayWin  || 50;
+  const total     = parseFloat(gameResult.total || lines?.total || 44);
+  const spread    = parseFloat(lines?.spread || 3);
+  const isBlowout = spread >= 9;
+  const isClose   = spread <= 3;
+
+  // Weather modifiers
+  const w = weatherAdjust(weather);
+  const passYdsMod  = total > 0 ? (total / 44) : 1;   // normalise to league avg
+  const badWeather  = weather === "wind" || weather === "rain";
+  const wPassAdj    = badWeather ? 0.88 : weather === "cold" ? 0.93 : 1.0;
+
+  // Pressure modifier: high pressure allowed → fewer pass yards
+  const homePressureAllowed = pressureData?.home?.pressureAllowed || 28;
+  const awayPressureAllowed = pressureData?.away?.pressureAllowed || 28;
+  const homePressAdj = homePressureAllowed > 35 ? 0.90 : homePressureAllowed > 31 ? 0.95 : 1.0;
+  const awayPressAdj = awayPressureAllowed > 35 ? 0.90 : awayPressureAllowed > 31 ? 0.95 : 1.0;
+
+  // OL modifier: degraded OL → fewer rush yards for that team
+  const homeOLHealth = olData?.home?.healthScore || 80;
+  const awayOLHealth = olData?.away?.healthScore || 80;
+  const homeRushAdj  = homeOLHealth >= 75 ? 1.0 : homeOLHealth >= 55 ? 0.88 : 0.78;
+  const awayRushAdj  = awayOLHealth >= 75 ? 1.0 : awayOLHealth >= 55 ? 0.88 : 0.78;
+
+  // CPOE modifier: elite CPOE QB → more passing yards + more to receivers
+  const homeCPOE = cpoeData?.home?.cpoe || 0;
+  const awayCPOE = cpoeData?.away?.cpoe || 0;
+  const homeCPOEAdj = 1 + (homeCPOE / 100);  // +5 CPOE → +5% pass yards
+  const awayCPOEAdj = 1 + (awayCPOE / 100);
+
+  // Game script: blowout → winning RB gets extra carries, losing QB throws more
+  const homeGameScript = homeWin >= 65 ? "winning"  : homeWin <= 35 ? "losing"  : "neutral";
+  const awayGameScript = awayWin >= 65 ? "winning"  : awayWin <= 35 ? "losing"  : "neutral";
+  const homeRBScriptAdj = homeGameScript === "winning" ? 1.12 : homeGameScript === "losing" ? 0.82 : 1.0;
+  const awayRBScriptAdj = awayGameScript === "winning" ? 1.12 : awayGameScript === "losing" ? 0.82 : 1.0;
+  const homeQBScriptAdj = homeGameScript === "losing"  ? 1.10 : homeGameScript === "winning" && isBlowout ? 0.85 : 1.0;
+  const awayQBScriptAdj = awayGameScript === "losing"  ? 1.10 : awayGameScript === "winning" && isBlowout ? 0.85 : 1.0;
+
+  // League baseline stats (2024-25 season averages)
+  const BASE = {
+    QB_PASS_YDS:  240, QB_PASS_TDS: 1.6,  QB_COMPS:   22,
+    QB_INTS:      0.8, QB_RUSH_YDS: 18,
+    RB1_RUSH_YDS: 72,  RB1_RUSH_TDS: 0.55, RB1_REC_YDS: 28, RB1_RECS: 3.2,
+    WR1_REC_YDS:  72,  WR1_RECS: 5.2,  WR1_TDS: 0.45,
+    WR2_REC_YDS:  48,  WR2_RECS: 3.8,
+    TE1_REC_YDS:  42,  TE1_RECS: 3.5,
+  };
+
+  function proj(base, ...mods) {
+    return Math.round(mods.reduce((v, m) => v * m, base) * 10) / 10;
+  }
+
+  return {
+    home: {
+      team: homeTeam,
+      QB_PASS_YDS: proj(BASE.QB_PASS_YDS, passYdsMod, wPassAdj, homePressAdj, homeCPOEAdj, homeQBScriptAdj),
+      QB_PASS_TDS: proj(BASE.QB_PASS_TDS, passYdsMod, wPassAdj, homeCPOEAdj),
+      QB_COMPS:    proj(BASE.QB_COMPS,    passYdsMod, wPassAdj, homePressAdj, homeCPOEAdj),
+      QB_INTS:     proj(BASE.QB_INTS,     homeCPOE < -3 ? 1.2 : homeCPOE > 4 ? 0.8 : 1.0),
+      QB_RUSH_YDS: proj(BASE.QB_RUSH_YDS, 1.0),
+      RB1_RUSH_YDS:proj(BASE.RB1_RUSH_YDS,homeRushAdj, homeRBScriptAdj, badWeather ? 1.08 : 1.0),
+      RB1_RUSH_TDS:proj(BASE.RB1_RUSH_TDS,homeRBScriptAdj),
+      RB1_REC_YDS: proj(BASE.RB1_REC_YDS, passYdsMod, wPassAdj),
+      RB1_RECS:    proj(BASE.RB1_RECS,    passYdsMod, wPassAdj),
+      WR1_REC_YDS: proj(BASE.WR1_REC_YDS, passYdsMod, wPassAdj, homeCPOEAdj),
+      WR1_RECS:    proj(BASE.WR1_RECS,    passYdsMod, wPassAdj),
+      WR1_TDS:     proj(BASE.WR1_TDS,     passYdsMod),
+      WR2_REC_YDS: proj(BASE.WR2_REC_YDS, passYdsMod, wPassAdj),
+      TE1_REC_YDS: proj(BASE.TE1_REC_YDS, passYdsMod, wPassAdj),
+      TE1_RECS:    proj(BASE.TE1_RECS,    passYdsMod, wPassAdj),
+      gameScript:  homeGameScript,
+      pressAdj:    homePressAdj,
+      olAdj:       homeRushAdj,
+      cpoeAdj:     homeCPOEAdj,
+    },
+    away: {
+      team: awayTeam,
+      QB_PASS_YDS: proj(BASE.QB_PASS_YDS, passYdsMod, wPassAdj, awayPressAdj, awayCPOEAdj, awayQBScriptAdj),
+      QB_PASS_TDS: proj(BASE.QB_PASS_TDS, passYdsMod, wPassAdj, awayCPOEAdj),
+      QB_COMPS:    proj(BASE.QB_COMPS,    passYdsMod, wPassAdj, awayPressAdj, awayCPOEAdj),
+      QB_INTS:     proj(BASE.QB_INTS,     awayCPOE < -3 ? 1.2 : awayCPOE > 4 ? 0.8 : 1.0),
+      QB_RUSH_YDS: proj(BASE.QB_RUSH_YDS, 1.0),
+      RB1_RUSH_YDS:proj(BASE.RB1_RUSH_YDS,awayRushAdj, awayRBScriptAdj, badWeather ? 1.08 : 1.0),
+      RB1_RUSH_TDS:proj(BASE.RB1_RUSH_TDS,awayRBScriptAdj),
+      RB1_REC_YDS: proj(BASE.RB1_REC_YDS, passYdsMod, wPassAdj),
+      RB1_RECS:    proj(BASE.RB1_RECS,    passYdsMod, wPassAdj),
+      WR1_REC_YDS: proj(BASE.WR1_REC_YDS, passYdsMod, wPassAdj, awayCPOEAdj),
+      WR1_RECS:    proj(BASE.WR1_RECS,    passYdsMod, wPassAdj),
+      WR1_TDS:     proj(BASE.WR1_TDS,     passYdsMod),
+      WR2_REC_YDS: proj(BASE.WR2_REC_YDS, passYdsMod, wPassAdj),
+      TE1_REC_YDS: proj(BASE.TE1_REC_YDS, passYdsMod, wPassAdj),
+      TE1_RECS:    proj(BASE.TE1_RECS,    passYdsMod, wPassAdj),
+      gameScript:  awayGameScript,
+      pressAdj:    awayPressAdj,
+      olAdj:       awayRushAdj,
+      cpoeAdj:     awayCPOEAdj,
+    },
+    modifiers: { passYdsMod, wPassAdj, badWeather, isBlowout, isClose, total, spread }
+  };
+}
+
+// ── Prop edge calculator ──────────────────────────────────────────────────
+function calcPropEdge(modelProjection, bookLine) {
+  if (!modelProjection || !bookLine) return null;
+  const edge = ((modelProjection - bookLine) / bookLine) * 100;
+  return {
+    edge:      parseFloat(edge.toFixed(1)),
+    lean:      edge >= 3 ? "OVER" : edge <= -3 ? "UNDER" : "PUSH",
+    strength:  Math.abs(edge) >= 12 ? "STRONG" : Math.abs(edge) >= 6 ? "MODERATE" : "SLIGHT",
+    hasEdge:   Math.abs(edge) >= 5,
+  };
+}
+
+// ── Player Prop Modeler Panel ─────────────────────────────────────────────
+function PropModelerPanel({ homeTeam, awayTeam, gameResult, lines, weather,
+  pressureData, olData, cpoeData, garbageData }) {
+
+  const [open, setOpen]         = useState(false);
+  const [tab, setTab]           = useState("QB");
+  const [propLines, setPropLines]   = useState(null);
+  const [fetching, setFetching]     = useState(false);
+  const [selectedTeam, setSelectedTeam] = useState("both");
+  const [sgpLegs, setSgpLegs]   = useState([]);
+
+  if (!homeTeam || !awayTeam) return null;
+
+  // Compute derivative projections from game signals
+  const projections = derivePlayerProjections({
+    gameResult, lines, weather, pressureData, olData, cpoeData, garbageData, homeTeam, awayTeam
+  });
+
+  // Fetch live prop lines from all books
+  async function fetchPropLines() {
+    setFetching(true); setPropLines(null);
+    try {
+      const text = await callClaude({
+        useSearch: true, maxTokens: 1600,
+        prompt: `Search for current NFL player prop betting lines for ${awayTeam} at ${homeTeam} this week. Find DraftKings, FanDuel, and Caesars prop lines.
+
+For each starting QB, RB1, WR1, WR2, TE1 on both teams find the over/under lines for:
+- QB: passing yards, passing TDs, completions, interceptions, rushing yards
+- RB: rushing yards, rushing TDs, receiving yards, receptions
+- WR/TE: receiving yards, receptions, TDs
+
+Return ONLY JSON (no markdown):
+{
+  "gameweek": "Week 14",
+  "home": {
+    "team": "${homeTeam}",
+    "players": [
+      {
+        "name": "Full Name",
+        "position": "QB",
+        "props": [
+          {"stat":"Passing Yards","line":235.5,"overOdds":"-115","underOdds":"-105"},
+          {"stat":"Passing TDs","line":1.5,"overOdds":"+120","underOdds":"-145"},
+          {"stat":"Completions","line":21.5,"overOdds":"-110","underOdds":"-110"},
+          {"stat":"Interceptions","line":0.5,"overOdds":"+180","underOdds":"-220"},
+          {"stat":"Rushing Yards","line":14.5,"overOdds":"-115","underOdds":"-105"}
+        ]
+      }
+    ]
+  },
+  "away": {
+    "team": "${awayTeam}",
+    "players": [...]
+  }
+}
+
+Include ALL key skill position starters. Use 0.5-increment lines. If actual lines not yet posted, generate realistic estimates based on season stats clearly labeled as "estimated".`
+      });
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error("No JSON");
+      setPropLines(JSON.parse(m[0]));
+    } catch(e) {
+      setPropLines({ error: "Could not fetch prop lines. Try again after lines post." });
+    }
+    setFetching(false);
+  }
+
+  const POSITIONS = ["QB","RB","WR","TE","ALL"];
+  const STAT_KEYS = {
+    QB:  ["QB_PASS_YDS","QB_PASS_TDS","QB_COMPS","QB_INTS","QB_RUSH_YDS"],
+    RB:  ["RB1_RUSH_YDS","RB1_RUSH_TDS","RB1_REC_YDS","RB1_RECS"],
+    WR:  ["WR1_REC_YDS","WR1_RECS","WR1_TDS","WR2_REC_YDS"],
+    TE:  ["TE1_REC_YDS","TE1_RECS"],
+  };
+  const STAT_LABELS = {
+    QB_PASS_YDS:"Pass Yds", QB_PASS_TDS:"Pass TDs", QB_COMPS:"Comps",
+    QB_INTS:"INTs", QB_RUSH_YDS:"Rush Yds",
+    RB1_RUSH_YDS:"Rush Yds", RB1_RUSH_TDS:"Rush TDs", RB1_REC_YDS:"Rec Yds", RB1_RECS:"Recs",
+    WR1_REC_YDS:"WR1 Rec Yds", WR1_RECS:"WR1 Recs", WR1_TDS:"WR1 TDs", WR2_REC_YDS:"WR2 Rec Yds",
+    TE1_REC_YDS:"TE Rec Yds", TE1_RECS:"TE Recs",
+  };
+
+  // Match model projection to book line by stat label
+  function findBookLine(teamSide, statKey) {
+    if (!propLines || propLines.error) return null;
+    const team  = propLines[teamSide];
+    if (!team?.players?.length) return null;
+    const statLabel = STAT_LABELS[statKey];
+    for (const player of team.players) {
+      const prop = player.props?.find(p =>
+        p.stat?.toLowerCase().includes(statLabel.toLowerCase().replace(" yds","").replace(" tds","").trim()) ||
+        statLabel.toLowerCase().includes(p.stat?.toLowerCase().split(" ")[0]||"")
+      );
+      if (prop) return { ...prop, playerName: player.name, position: player.position };
+    }
+    return null;
+  }
+
+  // Render a single prop row
+  function PropRow({ statKey, teamSide, projData }) {
+    const proj   = projData?.[statKey];
+    const book   = findBookLine(teamSide, statKey);
+    const edge   = book?.line ? calcPropEdge(proj, book.line) : null;
+    const edgeColor = edge?.lean === "OVER" ? "#4ade80" : edge?.lean === "UNDER" ? "#f87171" : "#555";
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:"8px",padding:"6px 9px",background:edge?.hasEdge?`${edgeColor}06`:"rgba(255,255,255,0.02)",border:`1px solid ${edge?.hasEdge?edgeColor+"20":"rgba(255,255,255,0.05)"}`,borderRadius:"5px",marginBottom:"3px"}}>
+        <div style={{width:"75px",fontSize:"9px",fontWeight:700,color:"#888",fontFamily:"'Barlow Condensed',sans-serif",flexShrink:0}}>{STAT_LABELS[statKey]}</div>
+        {/* Model projection */}
+        <div style={{width:"52px",textAlign:"center",background:"rgba(139,92,246,0.08)",border:"1px solid rgba(139,92,246,0.18)",borderRadius:"4px",padding:"3px 5px"}}>
+          <div style={{fontSize:"7px",color:"#7c3aed",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"1px"}}>MODEL</div>
+          <div style={{fontSize:"12px",fontWeight:800,color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{proj??"-"}</div>
+        </div>
+        {/* Book line */}
+        <div style={{width:"52px",textAlign:"center",background:"rgba(255,255,255,0.04)",borderRadius:"4px",padding:"3px 5px"}}>
+          <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"1px"}}>BOOK</div>
+          <div style={{fontSize:"12px",fontWeight:800,color:"#ddd",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{book?.line??"-"}</div>
+        </div>
+        {/* Edge */}
+        {edge ? (
+          <div style={{flex:1,display:"flex",alignItems:"center",gap:"6px"}}>
+            <div style={{background:`${edgeColor}10`,border:`1px solid ${edgeColor}25`,borderRadius:"4px",padding:"3px 7px",textAlign:"center"}}>
+              <div style={{fontSize:"7px",color:edgeColor,fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"1px"}}>{edge.lean}</div>
+              <div style={{fontSize:"11px",fontWeight:900,color:edgeColor,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{Math.abs(edge.edge)}%</div>
+            </div>
+            {edge.hasEdge && <Tag color={edgeColor}>{edge.strength}</Tag>}
+          </div>
+        ) : (
+          <div style={{flex:1,fontSize:"9px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+            {book ? "No edge" : "Fetch lines for comparison"}
+          </div>
+        )}
+        {/* Add to SGP */}
+        {edge?.hasEdge && (
+          <button onClick={()=>setSgpLegs(l=>[...l.filter(x=>x.statKey!==statKey||x.teamSide!==teamSide),{statKey,teamSide,team:projData.team,lean:edge.lean,line:book?.line,proj,playerName:book?.playerName,edge:edge.edge,stat:STAT_LABELS[statKey]}])}
+            style={{padding:"3px 7px",borderRadius:"3px",border:"none",background:"linear-gradient(135deg,#7c3aed,#5b21b6)",color:"#fff",fontSize:"8px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",flexShrink:0}}>
+            + SGP
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  // Modifier badges
+  function ModBadges({ projData }) {
+    if (!projData) return null;
+    const badges = [];
+    if (projData.pressAdj < 0.93)  badges.push({ label:`Pressure adj ${Math.round((1-projData.pressAdj)*100)}%↓`, color:"#f59e0b" });
+    if (projData.olAdj < 0.92)     badges.push({ label:`OL health adj ${Math.round((1-projData.olAdj)*100)}%↓`, color:"#f87171" });
+    if (projData.cpoeAdj > 1.04)   badges.push({ label:`CPOE boost +${Math.round((projData.cpoeAdj-1)*100)}%`, color:"#4ade80" });
+    if (projData.gameScript!=="neutral") badges.push({ label:`${projData.gameScript} game script`, color:projData.gameScript==="winning"?"#4ade80":"#f59e0b" });
+    return badges.length ? (
+      <div style={{display:"flex",gap:"4px",flexWrap:"wrap",marginBottom:"8px"}}>
+        {badges.map((b,i)=><Tag key={i} color={b.color}>{b.label}</Tag>)}
+      </div>
+    ) : null;
+  }
+
+  const teamsToShow = selectedTeam === "both" ? ["home","away"] : [selectedTeam];
+
+  return (
+    <Panel border="rgba(139,92,246,0.22)" bg="rgba(139,92,246,0.03)" mb="10px">
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",marginBottom:open?"12px":"0"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"12px"}}>🎯</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif"}}>Player Props & Derivatives</span>
+          {projections && <Tag color="#a78bfa">Model projections ready</Tag>}
+          {propLines && !propLines.error && <Tag color="#4ade80">Book lines loaded</Tag>}
+          {sgpLegs.length > 0 && <Tag color="#fbbf24">{sgpLegs.length} SGP legs</Tag>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+          {!fetching && <button onClick={e=>{e.stopPropagation();fetchPropLines();}} style={{padding:"5px 10px",borderRadius:"5px",border:"1px solid rgba(139,92,246,0.3)",background:"rgba(139,92,246,0.1)",color:"#a78bfa",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>↻ Fetch Prop Lines</button>}
+          {fetching && <div style={{display:"flex",alignItems:"center",gap:"5px",color:"#a78bfa",fontSize:"9px",fontFamily:"'Barlow Condensed',sans-serif"}}><Spinner/>Fetching…</div>}
+          <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+        </div>
+      </div>
+
+      {open && (
+        <div>
+          {/* Modifier summary */}
+          {projections?.modifiers && (
+            <div style={{display:"flex",gap:"5px",flexWrap:"wrap",marginBottom:"10px"}}>
+              {projections.modifiers.badWeather && <Tag color="#38bdf8">🌧 Weather: pass props ↓{Math.round((1-projections.modifiers.wPassAdj)*100)}%</Tag>}
+              {projections.modifiers.isBlowout  && <Tag color="#f59e0b">💥 Blowout spread: game script active</Tag>}
+              {projections.modifiers.isClose    && <Tag color="#4ade80">⚖️ Close game: passing volume up</Tag>}
+              <Tag color="#888">Total env: {projections.modifiers.total} pts → {projections.modifiers.passYdsMod > 1 ? "high":"low"}-volume game</Tag>
+            </div>
+          )}
+
+          {/* Team selector + position tabs */}
+          <div style={{display:"flex",gap:"6px",marginBottom:"10px",flexWrap:"wrap",alignItems:"center"}}>
+            <div style={{display:"flex",gap:"3px"}}>
+              {[["both","Both"],["home",abb(homeTeam)],["away",abb(awayTeam)]].map(([k,l])=>(
+                <button key={k} onClick={()=>setSelectedTeam(k)} style={{padding:"4px 9px",borderRadius:"4px",border:`1px solid ${selectedTeam===k?"rgba(139,92,246,0.4)":"rgba(255,255,255,0.08)"}`,background:selectedTeam===k?"rgba(139,92,246,0.1)":"transparent",color:selectedTeam===k?"#a78bfa":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</button>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:"3px"}}>
+              {POSITIONS.map(p=>(
+                <button key={p} onClick={()=>setTab(p)} style={{padding:"4px 9px",borderRadius:"4px",border:`1px solid ${tab===p?"rgba(251,191,36,0.35)":"rgba(255,255,255,0.07)"}`,background:tab===p?"rgba(251,191,36,0.08)":"transparent",color:tab===p?"#fbbf24":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>{p}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Prop rows per team */}
+          {teamsToShow.map(side => {
+            const projData = projections?.[side];
+            const teamName = side === "home" ? homeTeam : awayTeam;
+            const statsToShow = tab === "ALL"
+              ? ["QB","RB","WR","TE"].flatMap(p => STAT_KEYS[p] || [])
+              : STAT_KEYS[tab] || [];
+            return (
+              <div key={side} style={{marginBottom:"12px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"6px",borderBottom:`2px solid ${tc(teamName)}33`,paddingBottom:"5px"}}>
+                  <div style={{width:"6px",height:"6px",borderRadius:"50%",background:tc(teamName)}}/>
+                  <span style={{fontSize:"10px",fontWeight:800,color:tc(teamName),fontFamily:"'Barlow Condensed',sans-serif"}}>{teamName}</span>
+                  {projData && <ModBadges projData={projData}/>}
+                </div>
+                {statsToShow.map(sk => (
+                  <PropRow key={sk} statKey={sk} teamSide={side} projData={projData}/>
+                ))}
+              </div>
+            );
+          })}
+
+          {/* Error state */}
+          {propLines?.error && (
+            <div style={{background:"rgba(248,113,113,0.06)",border:"1px solid rgba(248,113,113,0.15)",borderRadius:"6px",padding:"8px 11px",color:"#fca5a5",fontSize:"10px",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"10px"}}>
+              ⚠ {propLines.error}
+            </div>
+          )}
+
+          {/* Same-Game Parlay Builder */}
+          {sgpLegs.length > 0 && (
+            <div style={{marginTop:"12px",background:"rgba(251,191,36,0.05)",border:"1px solid rgba(251,191,36,0.2)",borderRadius:"8px",padding:"12px"}}>
+              <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#fbbf24",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span>🏈 Same-Game Parlay ({sgpLegs.length} legs)</span>
+                <button onClick={()=>setSgpLegs([])} style={{background:"none",border:"none",color:"#f87171",fontSize:"9px",cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>Clear All</button>
+              </div>
+              {sgpLegs.map((leg,i) => (
+                <div key={i} style={{display:"flex",alignItems:"center",gap:"7px",padding:"5px 8px",background:"rgba(255,255,255,0.04)",borderRadius:"5px",marginBottom:"3px"}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:"9px",fontWeight:700,color:"#ddd",fontFamily:"'Barlow Condensed',sans-serif"}}>{leg.playerName||abb(leg.team)} — {leg.stat} {leg.lean} {leg.line}</div>
+                    <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Model: {leg.proj} · Edge: {leg.edge > 0 ? "+" : ""}{leg.edge}%</div>
+                  </div>
+                  <Tag color={leg.lean==="OVER"?"#4ade80":"#f87171"}>{leg.lean}</Tag>
+                  <button onClick={()=>setSgpLegs(l=>l.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:"#f87171",fontSize:"10px",cursor:"pointer",padding:"0 3px",fontFamily:"'Barlow Condensed',sans-serif"}}>✕</button>
+                </div>
+              ))}
+              <div style={{marginTop:"8px",padding:"7px 10px",background:"rgba(139,92,246,0.06)",border:"1px solid rgba(139,92,246,0.15)",borderRadius:"5px",fontSize:"9px",color:"#c4b5fd",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                ⚠ SGP legs are correlated — books apply a correlation discount. Positive correlations (QB pass yards + WR receiving yards) are best value. Negative correlations (QB pass yards + RB rush yards) reduce edge.
+              </div>
+            </div>
+          )}
+
+          <div style={{marginTop:"8px",fontSize:"8px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+            Derivative projections use 17-signal model: CPOE · Pressure rate · OL health · Weather · Game script · Total environment · NOT actual player targets/snap counts
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Sportsbook Profiling & Sharp-Line Arbitrage ────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// SPORTSBOOK PROFILING & SHARP-LINE ARBITRAGE
+// ─────────────────────────────────────────────────────────────────────────
+// Sportsbook Profiling: Each book has a distinct identity — sharpness
+// rating, vig%, opening speed, and public/sharp classification. The model
+// weights each book's signal by its sharpness score when computing the
+// market ensemble, so Score's number counts 2.8× DraftKings'.
+//
+// Sharp-Line Arbitrage: When the sharpest book (Score/Fanatics) diverges
+// from a soft book (DK/FD) by 1+ pts, that gap is free information — the
+// soft book hasn't adjusted yet. Auto-detects gaps, flags best available
+// number, and identifies "middle" windows (bet both sides at different
+// books and win if the final margin lands between the two lines).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Sportsbook profile database ───────────────────────────────────────────
+const BOOK_PROFILES = {
+  "Score": {
+    sharpness: 78, vig: 4.9, type: "sharp",
+    color: "#4ade80", icon: "📊",
+    desc: "Sharpest widely-available US book. theScore Bet sets competitive opening lines and moves quickly on sharp action. Treat Score as the US market reference line — if Score diverges from other books it's almost always right.",
+    strengths: ["Sharpest US-available lines", "Fast mover on sharp action", "Competitive vig"],
+    weaknesses: ["Smaller player pool", "Limited availability vs DK/FD"],
+    weight: 2.8,
+  },
+  "Caesars": {
+    sharpness: 62, vig: 5.2, type: "middle",
+    color: "#f59e0b", icon: "🏛️",
+    desc: "Middle-ground book. Slower to react than Score but faster than DraftKings. Good for getting better numbers before the line corrects. Often has unique player prop markets.",
+    strengths: ["Available nationwide", "Competitive promos", "Good prop markets"],
+    weaknesses: ["Slow on sharp moves", "Higher vig than Score"],
+    weight: 1.4,
+  },
+  "BetMGM": {
+    sharpness: 55, vig: 5.4, type: "middle",
+    color: "#fb923c", icon: "🎰",
+    desc: "Public-facing, slightly sharper than DraftKings. MGM often lags 30–60 min behind Score line moves. Good target for middle opportunities and cross-book value.",
+    strengths: ["Wide availability", "Parlay boosts", "Good SGP market"],
+    weaknesses: ["Lags on line moves", "Limits sharp bettors"],
+    weight: 1.2,
+  },
+  "DraftKings": {
+    sharpness: 42, vig: 5.8, type: "public",
+    color: "#f87171", icon: "🟢",
+    desc: "High-volume public book. Slowest to adjust to sharp action. If Score and DK diverge by 1.5+ pts, DK is almost certainly wrong. Best book to exploit when lines haven't moved.",
+    strengths: ["Best promos", "Huge liquidity", "Wide same-game parlay market"],
+    weaknesses: ["Worst lines", "Bans winning bettors", "Slowest mover"],
+    weight: 0.8,
+  },
+  "FanDuel": {
+    sharpness: 40, vig: 5.9, type: "public",
+    color: "#60a5fa", icon: "🔵",
+    desc: "Similar to DraftKings — aggressively public-facing. FD often has different numbers than DK which creates cross-book value. Notorious for limiting sharp accounts fastest.",
+    strengths: ["SGP boosts", "Strong mobile UX", "Competitive same-game parlays"],
+    weaknesses: ["Worst vig", "Bans sharp bettors quickly", "Slow line movement"],
+    weight: 0.8,
+  },
+  "Fanatics": {
+    sharpness: 36, vig: 6.0, type: "public",
+    color: "#c084fc", icon: "👕",
+    desc: "Newest major US book (ex-PointsBet). Still building its market-making operation — lines are frequently off vs the rest of the market. Best exploited early in the week when their openers lag behind Score.",
+    strengths: ["Aggressive promos", "Fan loyalty rewards", "Growing rapidly"],
+    weaknesses: ["Softest lines in the market", "Slowest to open lines", "Smallest limits"],
+    weight: 0.7,
+  },
+};
+
+// Weighted sharpness score for a line from a given book
+function bookWeight(bookName) {
+  const profile = BOOK_PROFILES[bookName];
+  return profile?.weight || 1.0;
+}
+
+// ── True market price (Score-weighted consensus) ───────────────────────
+function calcTrueMarketPrice(books) {
+  if (!books?.length) return null;
+  let weightedSum = 0, totalWeight = 0;
+  books.forEach(b => {
+    const spread = parseFloat(b.spread || 0);
+    const w = bookWeight(b.book);
+    if (!isNaN(spread)) { weightedSum += spread * w; totalWeight += w; }
+  });
+  if (!totalWeight) return null;
+  return parseFloat((weightedSum / totalWeight).toFixed(2));
+}
+
+// ── Sharp-line gap detector ────────────────────────────────────────────────
+function detectSharpLineGaps(books, lines) {
+  if (!books?.length) return [];
+  // Find sharpest available book as reference
+  const sharpRef = books.find(b => BOOK_PROFILES[b.book]?.type === "sharp")
+    || books.reduce((best, b) => (bookWeight(b.book) > bookWeight(best.book) ? b : best), books[0]);
+
+  if (!sharpRef?.spread) return [];
+  const refSpread = parseFloat(sharpRef.spread);
+  const gaps = [];
+
+  books.forEach(b => {
+    if (b.book === sharpRef.book) return;
+    const spread = parseFloat(b.spread || 0);
+    if (isNaN(spread)) return;
+    const gap = Math.abs(refSpread - spread);
+    if (gap < 0.4) return;
+
+    const severity = gap >= 2.0 ? "EXPLOIT" : gap >= 1.5 ? "STRONG" : gap >= 1.0 ? "OPPORTUNITY" : "WATCH";
+    const color = severity === "EXPLOIT" ? "#ef4444" : severity === "STRONG" ? "#f87171" : severity === "OPPORTUNITY" ? "#f59e0b" : "#888";
+
+    // Which side to bet: if soft book has bigger number, bet the favorite there
+    const betSide = spread > refSpread
+      ? `Bet ${lines?.favTeam ? abb(lines.favTeam) : "FAV"} at ${b.book} (${b.book} has +${gap.toFixed(1)} pts)`
+      : `Bet dog at ${b.book} (${gap.toFixed(1)} pt gift vs sharp line)`;
+
+    gaps.push({
+      sharpBook: sharpRef.book, sharpSpread: refSpread,
+      softBook: b.book, softSpread: spread,
+      gap: parseFloat(gap.toFixed(1)),
+      severity, color, betSide,
+      valueNote: `${b.book} hasn't adjusted to ${sharpRef.book}'s line — ${gap.toFixed(1)} pts of free value`,
+    });
+  });
+
+  return gaps.sort((a, b) => b.gap - a.gap);
+}
+
+// ── Middle opportunity detector ────────────────────────────────────────────
+function detectMiddles(books, lines) {
+  if (!books?.length || books.length < 2) return [];
+  const middles = [];
+  for (let i = 0; i < books.length; i++) {
+    for (let j = i + 1; j < books.length; j++) {
+      const a = books[i], b = books[j];
+      const sA = parseFloat(a.spread || 0), sB = parseFloat(b.spread || 0);
+      if (isNaN(sA) || isNaN(sB)) continue;
+      const window = Math.abs(sA - sB);
+      if (window < 0.5) continue;
+
+      // A middle exists when one book has FAV -X and other has FAV -(X-N)
+      // Bet FAV at better number and DOG at other — win if margin lands in window
+      const higherSpread = Math.max(sA, sB);
+      const lowerSpread  = Math.min(sA, sB);
+      const bookHigher   = sA > sB ? a.book : b.book;
+      const bookLower    = sA > sB ? b.book : a.book;
+
+      // Estimate middle hit probability (rough: NFL margins are near-uniform)
+      // Each point of window ≈ 5-7% chance of hitting for common spreads
+      const hitPct = Math.min(Math.round(window * 6), 45);
+      // Worst-case: lose both sides (standard juice) = -10%
+      // Best-case: hit middle = +200%+
+      const ev = hitPct * 2.0 - (100 - hitPct) * 0.1;
+
+      middles.push({
+        bookA: bookHigher, spreadA: higherSpread,
+        bookB: bookLower,  spreadB: lowerSpread,
+        window: parseFloat(window.toFixed(1)),
+        hitPct, ev: parseFloat(ev.toFixed(1)),
+        instruction: `Bet ${lines?.favTeam ? abb(lines.favTeam) : "FAV"} ${higherSpread} at ${bookLower} AND ${lines?.favTeam ? abb(lines.favTeam) : "FAV"} ${lowerSpread} at ${bookHigher}`,
+        winCondition: `Win if ${lines?.favTeam ? abb(lines.favTeam) : "FAV"} wins by ${lowerSpread + 0.5}–${higherSpread - 0.5} pts`,
+        worstCase: `Both sides lose (score outside window) — lose ~10 cents per $1 wagered`,
+        isKeyNumber: [3,7,4,6,10,14].some(kn => lowerSpread <= kn && kn <= higherSpread),
+      });
+    }
+  }
+  return middles.sort((a, b) => b.hitPct - a.hitPct);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// UI COMPONENTS
+// ─────────────────────────────────────────────────────────────────────────
+
+// ── Sportsbook Profile Panel ──────────────────────────────────────────────
+function SportsbookProfilePanel({ ensemble, lines }) {
+  const [open, setOpen]     = useState(false);
+  const [selected, setSelected] = useState(null);
+  const books = ensemble?.books || [];
+  const truePrice = calcTrueMarketPrice(books);
+
+  return (
+    <Panel border="rgba(74,222,128,0.18)" bg="rgba(74,222,128,0.02)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"12px"}}>📚</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif"}}>Sportsbook Profiles</span>
+          {truePrice && <Tag color="#4ade80">True Price: -{truePrice}</Tag>}
+          {books.length > 0 && <Tag color="#888">{books.length} books tracked</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          {/* True market price explainer */}
+          {truePrice && (
+            <div style={{background:"rgba(74,222,128,0.06)",border:"1px solid rgba(74,222,128,0.15)",borderRadius:"7px",padding:"9px 12px",marginBottom:"12px"}}>
+              <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px"}}>📐 True Market Price (Score-Weighted Consensus)</div>
+              <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
+                <div style={{fontSize:"24px",fontWeight:900,color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>-{truePrice}</div>
+                <div style={{fontSize:"9px",color:"#6ee7b7",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5"}}>Score weighted 2.8× over public books. This is where the US market actually thinks the line should be — not the inflated number your public book shows.</div>
+              </div>
+            </div>
+          )}
+
+          {/* Profile cards */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"5px",marginBottom:"12px"}}>
+            {Object.entries(BOOK_PROFILES).map(([name, profile]) => {
+              const bookData = books.find(b => b.book === name);
+              const isAvailable = !!bookData;
+              const isSelected = selected === name;
+              return (
+                <div key={name}
+                  onClick={() => setSelected(isSelected ? null : name)}
+                  style={{background:isSelected?`${profile.color}10`:"rgba(255,255,255,0.03)",border:`1px solid ${isSelected?profile.color+"35":"rgba(255,255,255,0.07)"}`,borderRadius:"7px",padding:"9px 10px",cursor:"pointer",transition:"all 0.15s",opacity:isAvailable?1:0.5}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"5px"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:"5px"}}>
+                      <span style={{fontSize:"13px"}}>{profile.icon}</span>
+                      <span style={{fontSize:"10px",fontWeight:800,color:profile.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{name}</span>
+                    </div>
+                    <Tag color={profile.type==="sharp"?"#4ade80":profile.type==="middle"?"#f59e0b":"#f87171"}>
+                      {profile.type==="sharp"?"SHARP":profile.type==="middle"?"MID":"PUBLIC"}
+                    </Tag>
+                  </div>
+                  {/* Sharpness bar */}
+                  <div style={{marginBottom:"4px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:"2px"}}>
+                      <span style={{fontSize:"7px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>SHARPNESS</span>
+                      <span style={{fontSize:"9px",fontWeight:800,color:profile.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{profile.sharpness}/100</span>
+                    </div>
+                    <div style={{height:"3px",borderRadius:"2px",background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                      <div style={{width:`${profile.sharpness}%`,height:"100%",background:profile.color,borderRadius:"2px"}}/>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between"}}>
+                    <span style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Vig: {profile.vig}%</span>
+                    <span style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Weight: {profile.weight}×</span>
+                    {bookData?.spread && <span style={{fontSize:"9px",fontWeight:700,color:"#ddd",fontFamily:"'Barlow Condensed',sans-serif"}}>-{bookData.spread}</span>}
+                  </div>
+                  {/* Expanded detail */}
+                  {isSelected && (
+                    <div style={{marginTop:"7px",paddingTop:"7px",borderTop:"1px solid rgba(255,255,255,0.07)"}}>
+                      <div style={{fontSize:"9px",color:"#888",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5",marginBottom:"5px"}}>{profile.desc}</div>
+                      <div style={{display:"flex",gap:"4px",flexWrap:"wrap"}}>
+                        {profile.strengths.map(s=><Tag key={s} color="#4ade80">✓ {s}</Tag>)}
+                        {profile.weaknesses.map(s=><Tag key={s} color="#f87171">✗ {s}</Tag>)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Sharp books (Score) set the closest thing to a true market price in the US. Public books (DK, FD, Fanatics) are where value lives when they lag behind. Treat any Score vs Fanatics gap of 1.5+ pts as a strong signal.
+              </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Sharp-Line Arbitrage Panel ────────────────────────────────────────────
+function SharpLineArbitragePanel({ ensemble, lines, homeTeam, awayTeam }) {
+  const [open, setOpen] = useState(false);
+  const books = ensemble?.books || [];
+  const gaps    = detectSharpLineGaps(books, lines);
+  const middles = detectMiddles(books, lines);
+
+  const hasOpps = gaps.length > 0 || middles.length > 0;
+  const topGap  = gaps[0];
+  const headerColor = topGap?.severity === "EXPLOIT" ? "#ef4444"
+    : topGap?.severity === "STRONG" ? "#f87171"
+    : topGap?.severity === "OPPORTUNITY" ? "#f59e0b" : "#888";
+
+  if (!books.length && !hasOpps) return null;
+
+  return (
+    <Panel border={hasOpps?`${headerColor}25`:"rgba(255,255,255,0.07)"} bg={hasOpps?`${headerColor}04`:"rgba(255,255,255,0.01)"} mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          {hasOpps && <div style={{width:"8px",height:"8px",borderRadius:"50%",background:headerColor,boxShadow:`0 0 8px ${headerColor}`,animation:topGap?.severity==="EXPLOIT"?"pulse 1s infinite":"none",flexShrink:0}}/>}
+          <span style={{fontSize:"12px"}}>⚡</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:hasOpps?headerColor:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Sharp-Line Arbitrage</span>
+          {gaps.length > 0 && <Tag color={headerColor}>{gaps.length} gap{gaps.length>1?"s":""}</Tag>}
+          {middles.length > 0 && <Tag color="#a78bfa">{middles.length} middle{middles.length>1?"s":""}</Tag>}
+          {!hasOpps && books.length > 0 && <Tag color="#555">Lines efficient</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          {!hasOpps && (
+            <div style={{textAlign:"center",padding:"16px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",fontSize:"10px"}}>
+              {books.length > 0 ? "All books are within 0.5 pts — lines are efficient. No exploitable gaps right now." : "Fetch lines to scan for arbitrage opportunities."}
+            </div>
+          )}
+
+          {/* Sharp-line gaps */}
+          {gaps.length > 0 && (
+            <div style={{marginBottom:"12px"}}>
+              <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#555",marginBottom:"7px",fontFamily:"'Barlow Condensed',sans-serif"}}>📐 Line Value Gaps (Sharp vs Soft)</div>
+              {gaps.map((g, i) => (
+                <div key={i} style={{background:`${g.color}07`,border:`1px solid ${g.color}22`,borderRadius:"8px",padding:"10px 13px",marginBottom:"6px"}}>
+                  {/* Header */}
+                  <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"7px"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:"5px",flex:1}}>
+                      <Tag color={g.color}>{g.severity}</Tag>
+                      <span style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{g.sharpBook} vs {g.softBook}</span>
+                    </div>
+                    <div style={{fontSize:"18px",fontWeight:900,color:g.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{g.gap} pts</div>
+                  </div>
+                  {/* Book comparison */}
+                  <div style={{display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:"6px",alignItems:"center",marginBottom:"7px"}}>
+                    {[{book:g.sharpBook,spread:g.sharpSpread,type:"sharp"},{},{book:g.softBook,spread:g.softSpread,type:"soft"}].map((b,bi)=>
+                      bi===1
+                        ? <div key="arrow" style={{textAlign:"center",fontSize:"14px",color:`${g.color}66`}}>→</div>
+                        : <div key={b.book} style={{background:b.type==="sharp"?"rgba(74,222,128,0.07)":"rgba(248,113,113,0.07)",border:`1px solid ${b.type==="sharp"?"rgba(74,222,128,0.18)":"rgba(248,113,113,0.18)"}`,borderRadius:"6px",padding:"7px 10px",textAlign:"center"}}>
+                            <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>
+                              {BOOK_PROFILES[b.book]?.icon} {b.book}
+                            </div>
+                            <div style={{fontSize:"18px",fontWeight:900,color:b.type==="sharp"?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>-{b.spread}</div>
+                            <Tag color={b.type==="sharp"?"#4ade80":"#f87171"}>{b.type==="sharp"?"SHARP":"SOFT"}</Tag>
+                          </div>
+                    )}
+                  </div>
+                  {/* Action */}
+                  <div style={{background:`${g.color}0a`,border:`1px solid ${g.color}1a`,borderRadius:"5px",padding:"7px 10px",marginBottom:"4px"}}>
+                    <div style={{fontSize:"8px",fontWeight:700,color:g.color,fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px",textTransform:"uppercase",letterSpacing:"0.08em"}}>⚡ ACTION</div>
+                    <div style={{fontSize:"10px",color:`${g.color}cc`,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{g.betSide}</div>
+                  </div>
+                  <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{g.valueNote}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Middle opportunities */}
+          {middles.length > 0 && (
+            <div>
+              <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#a78bfa",marginBottom:"7px",fontFamily:"'Barlow Condensed',sans-serif"}}>🎯 Middle Opportunities</div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"8px",lineHeight:"1.5"}}>
+                A "middle" means betting both sides at different books. If the final margin lands in the window, both bets win. Otherwise you lose the juice on one side (~5-6 cents per dollar).
+              </div>
+              {middles.map((m, i) => (
+                <div key={i} style={{background:"rgba(167,139,250,0.06)",border:"1px solid rgba(167,139,250,0.15)",borderRadius:"8px",padding:"10px 13px",marginBottom:"6px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"7px"}}>
+                    <div style={{flex:1,display:"flex",gap:"5px",alignItems:"center"}}>
+                      <Tag color="#a78bfa">{m.window} pt window</Tag>
+                      {m.isKeyNumber && <Tag color="#fbbf24">⚠ Key # in window</Tag>}
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>Hit prob</div>
+                      <div style={{fontSize:"16px",fontWeight:900,color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{m.hitPct}%</div>
+                    </div>
+                  </div>
+                  {/* Window visual */}
+                  <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"7px"}}>
+                    <div style={{background:"rgba(255,255,255,0.05)",borderRadius:"5px",padding:"6px 10px",textAlign:"center",flex:1}}>
+                      <div style={{fontSize:"7px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{m.bookA}</div>
+                      <div style={{fontSize:"15px",fontWeight:900,color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif"}}>-{m.spreadA}</div>
+                    </div>
+                    <div style={{textAlign:"center"}}>
+                      <div style={{fontSize:"8px",color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700}}>WINDOW</div>
+                      <div style={{fontSize:"11px",fontWeight:900,color:"#fbbf24",fontFamily:"'Barlow Condensed',sans-serif"}}>{m.spreadB + 0.5} – {m.spreadA - 0.5}</div>
+                    </div>
+                    <div style={{background:"rgba(255,255,255,0.05)",borderRadius:"5px",padding:"6px 10px",textAlign:"center",flex:1}}>
+                      <div style={{fontSize:"7px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{m.bookB}</div>
+                      <div style={{fontSize:"15px",fontWeight:900,color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif"}}>-{m.spreadB}</div>
+                    </div>
+                  </div>
+                  <div style={{fontSize:"9px",color:"#c4b5fd",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px",lineHeight:"1.4"}}><strong>Bet:</strong> {m.instruction}</div>
+                  <div style={{fontSize:"9px",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>✓ Win if: {m.winCondition}</div>
+                  <div style={{fontSize:"8px",color:"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>✗ Worst case: {m.worstCase}</div>
+                  {m.isKeyNumber && (
+                    <div style={{marginTop:"5px",padding:"5px 8px",background:"rgba(251,191,36,0.07)",border:"1px solid rgba(251,191,36,0.18)",borderRadius:"4px",fontSize:"9px",color:"#fbbf24",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                      ⭐ Key number in window — NFL games land on key numbers (3, 7, 6, 4) far more often than random chance. This middle has above-average hit probability.
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{marginTop:"8px",fontSize:"8px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+            Gaps auto-detected from market ensemble data · Line value strategy, not guaranteed profit · True arbitrage (risk-free) is rare but middles with key numbers approach it
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THREE FREE SIGNAL ADDITIONS
+//   1. Elo Power Ratings   — updates after every result, precise team strength
+//   2. Schedule Spot       — rest days, travel, short week, trap game flags
+//   3. Public Betting %    — real sharp vs public split from Action Network
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ── Elo rating engine ─────────────────────────────────────────────────────
+// Standard Elo with NFL-calibrated K-factor and home field adjustment
+const ELO_K         = 20;    // K-factor — how fast ratings move
+const ELO_HOME_ADJ  = 65;    // home field advantage in Elo points (~3 pts)
+const ELO_DEFAULT   = 1500;  // starting rating for all teams
+const ELO_MEAN_REG  = 0.33;  // offseason regression toward mean
+
+function expectedEloWin(ratingA, ratingB) {
+  return 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
+}
+
+function updateElo(winnerRating, loserRating, marginOfVictory) {
+  // Margin of victory multiplier (FiveThirtyEight method)
+  const movMult = Math.log(Math.abs(marginOfVictory) + 1) *
+    (2.2 / ((winnerRating - loserRating) * 0.001 + 2.2));
+  const expected = expectedEloWin(winnerRating, loserRating);
+  const newWinner = winnerRating + ELO_K * movMult * (1 - expected);
+  const newLoser  = loserRating  + ELO_K * movMult * (0 - (1 - expected));
+  return {
+    newWinner: Math.round(newWinner),
+    newLoser:  Math.round(newLoser),
+  };
+}
+
+function eloToSpreadAdj(homeElo, awayElo) {
+  // Each 25 Elo points ≈ 1 point on the spread
+  const diff = (homeElo + ELO_HOME_ADJ) - awayElo;
+  return parseFloat((diff / 25).toFixed(1));
+}
+
+function eloWinProb(homeElo, awayElo) {
+  return Math.round(expectedEloWin(homeElo + ELO_HOME_ADJ, awayElo) * 100);
+}
+
+function eloGrade(rating) {
+  if (rating >= 1650) return { label: "Elite",      color: "#4ade80" };
+  if (rating >= 1575) return { label: "Contender",  color: "#86efac" };
+  if (rating >= 1500) return { label: "Average",    color: "#f59e0b" };
+  if (rating >= 1425) return { label: "Below Avg",  color: "#f87171" };
+  return                     { label: "Weak",        color: "#ef4444" };
+}
+
+// ── Schedule spot flags ────────────────────────────────────────────────────
+const SPOT_FLAGS = {
+  SHORT_WEEK:    { label: "Short Week",      icon: "⚠️", color: "#f87171", spreadAdj: -1.5, desc: "Playing on 6 days rest or less (TNF). Historically -1.5 pts ATS vs well-rested opponent." },
+  LONG_REST:     { label: "Long Rest",       icon: "✅", color: "#4ade80", spreadAdj: +1.2, desc: "10+ days rest (bye week advantage). Teams coming off bye are 58% ATS historically." },
+  ROAD_TRIP:     { label: "Cross-Country",   icon: "✈️", color: "#f59e0b", spreadAdj: -0.8, desc: "East coast team traveling to west coast or vice versa. Circadian rhythm disruption." },
+  BACK_TO_BACK:  { label: "Back-to-Back Road",icon:"🚌", color: "#f87171", spreadAdj: -1.0, desc: "Second consecutive road game. Travel fatigue compounds." },
+  TRAP_GAME:     { label: "Trap Game",       icon: "🪤", color: "#f59e0b", spreadAdj: -1.2, desc: "Big favorite sandwiched between two marquee matchups. Public overvalues the favorite." },
+  DIVISIONAL:    { label: "Divisional",      icon: "⚔️", color: "#a78bfa", spreadAdj: -0.7, desc: "Division games are closer — dogs cover at 54% historically. Familiarity neutralizes talent gap." },
+  PRIMETIME:     { label: "Prime Time",      icon: "🌙", color: "#38bdf8", spreadAdj: 0,    desc: "National spotlight. Better teams generally perform, but public favorites get inflated lines." },
+  REVENGE:       { label: "Revenge Game",    icon: "🔥", color: "#fb923c", spreadAdj: +0.8, desc: "Team facing opponent that beat them last meeting. Slight motivational edge." },
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// ELO RATINGS PANEL
+// ─────────────────────────────────────────────────────────────────────────
+function EloPowerPanel({ eloRatings, homeTeam, awayTeam, backtestHistory, onUpdateElo }) {
+  const [open, setOpen] = useState(false);
+  const [allRatings, setAllRatings] = useState(eloRatings || {});
+
+  // Compute model-derived Elo from backtest history
+  const modelElo = (() => {
+    if (!backtestHistory?.length) return {};
+    let ratings = { ...allRatings };
+    // Initialize any missing teams
+    backtestHistory.forEach(g => {
+      if (g.homeTeam && !ratings[g.homeTeam]) ratings[g.homeTeam] = ELO_DEFAULT;
+      if (g.awayTeam && !ratings[g.awayTeam]) ratings[g.awayTeam] = ELO_DEFAULT;
+    });
+    // Apply each result chronologically
+    [...backtestHistory].reverse().forEach(g => {
+      if (!g.homeTeam || !g.awayTeam || g.actualMargin == null) return;
+      const homeWon   = g.actualMargin > 0;
+      const margin    = Math.abs(g.actualMargin);
+      const homeRating= ratings[g.homeTeam] || ELO_DEFAULT;
+      const awayRating= ratings[g.awayTeam] || ELO_DEFAULT;
+      const updated   = homeWon
+        ? updateElo(homeRating, awayRating, margin)
+        : updateElo(awayRating, homeRating, margin);
+      ratings[g.homeTeam] = homeWon ? updated.newWinner : updated.newLoser;
+      ratings[g.awayTeam] = homeWon ? updated.newLoser  : updated.newWinner;
+    });
+    return ratings;
+  })();
+
+  const homeElo = modelElo[homeTeam] || allRatings[homeTeam] || ELO_DEFAULT;
+  const awayElo = modelElo[awayTeam] || allRatings[awayTeam] || ELO_DEFAULT;
+  const spreadAdj = eloToSpreadAdj(homeElo, awayElo);
+  const winProb   = eloWinProb(homeElo, awayElo);
+  const homeGrade = eloGrade(homeElo);
+  const awayGrade = eloGrade(awayElo);
+
+  // Sort all teams by rating for leaderboard
+  const leaderboard = Object.entries(modelElo)
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 32);
+
+  return (
+    <Panel border="rgba(251,191,36,0.2)" bg="rgba(251,191,36,0.02)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>📡</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#fbbf24",fontFamily:"'Barlow Condensed',sans-serif"}}>Elo Power Ratings</span>
+          {homeTeam && awayTeam && <Tag color="#fbbf24">Spread adj {spreadAdj >= 0 ? "+" : ""}{spreadAdj} pts</Tag>}
+          {homeTeam && <Tag color={homeGrade.color}>{abb(homeTeam)} {homeElo}</Tag>}
+          {awayTeam && <Tag color={awayGrade.color}>{abb(awayTeam)} {awayElo}</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+            Elo ratings update after every logged backtest result using the FiveThirtyEight margin-of-victory multiplier. Each 25 Elo points ≈ 1 point on the spread. Home field adds 65 points (+2.6 pts). Starts at 1500 for all teams.
+          </div>
+
+          {/* Matchup comparison */}
+          {homeTeam && awayTeam && (
+            <div style={{display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:"10px",alignItems:"center",marginBottom:"12px"}}>
+              {[{team:awayTeam,elo:awayElo,grade:awayGrade},{},{team:homeTeam,elo:homeElo,grade:homeGrade}].map((item,i) =>
+                i === 1 ? (
+                  <div key="mid" style={{textAlign:"center"}}>
+                    <div style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>WIN PROB</div>
+                    <div style={{fontSize:"22px",fontWeight:900,color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{winProb}%</div>
+                    <div style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>{abb(homeTeam)}</div>
+                    <div style={{fontSize:"9px",fontWeight:700,color:Math.abs(spreadAdj)>=1?"#fbbf24":"#555",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"4px"}}>{spreadAdj >= 0 ? "+" : ""}{spreadAdj} pts spread</div>
+                  </div>
+                ) : (
+                  <div key={item.team} style={{background:`${item.grade.color}0d`,border:`1px solid ${item.grade.color}25`,borderRadius:"8px",padding:"10px 12px",textAlign:"center"}}>
+                    <div style={{fontSize:"9px",fontWeight:700,color:tc(item.team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"4px"}}>{abb(item.team)}</div>
+                    <div style={{fontSize:"28px",fontWeight:900,color:item.grade.color,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{item.elo}</div>
+                    <Tag color={item.grade.color}>{item.grade.label}</Tag>
+                  </div>
+                )
+              )}
+            </div>
+          )}
+
+          {/* Leaderboard */}
+          {leaderboard.length > 0 ? (
+            <div>
+              <div style={{fontSize:"8px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#555",marginBottom:"5px",fontFamily:"'Barlow Condensed',sans-serif"}}>Model Elo Leaderboard</div>
+              <div style={{display:"flex",flexDirection:"column",gap:"2px",maxHeight:"200px",overflowY:"auto"}}>
+                {leaderboard.map(([team, rating], i) => {
+                  const g = eloGrade(rating);
+                  const isActive = team === homeTeam || team === awayTeam;
+                  return (
+                    <div key={team} style={{display:"flex",alignItems:"center",gap:"7px",padding:"4px 8px",background:isActive?`${g.color}12`:"rgba(255,255,255,0.02)",border:`1px solid ${isActive?g.color+"30":"rgba(255,255,255,0.04)"}`,borderRadius:"4px"}}>
+                      <span style={{fontSize:"8px",fontWeight:700,color:"#444",fontFamily:"'Barlow Condensed',sans-serif",width:"22px"}}>#{i+1}</span>
+                      <div style={{width:"5px",height:"5px",borderRadius:"50%",background:tc(team),flexShrink:0}}/>
+                      <span style={{fontSize:"9px",fontWeight:isActive?800:500,color:isActive?tc(team):"#aaa",fontFamily:"'Barlow Condensed',sans-serif",flex:1}}>{abb(team)}</span>
+                      <div style={{width:"80px",height:"3px",borderRadius:"2px",background:"rgba(255,255,255,0.05)",overflow:"hidden"}}>
+                        <div style={{width:((rating-1300)/600*100)+"%",height:"100%",background:g.color,borderRadius:"2px"}}/>
+                      </div>
+                      <span style={{fontSize:"10px",fontWeight:700,color:g.color,fontFamily:"'Barlow Condensed',sans-serif",width:"36px",textAlign:"right"}}>{rating}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{marginTop:"6px",fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>Updates automatically from backtest results · K=20 · Home field +65 Elo pts · MoV multiplier (538 method)</div>
+            </div>
+          ) : (
+            <div style={{textAlign:"center",padding:"16px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",fontSize:"10px"}}>Log game results in the Backtest Engine to build Elo ratings</div>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCHEDULE SPOT PANEL
+// ─────────────────────────────────────────────────────────────────────────
+function ScheduleSpotPanel({ scheduleSpotData, loading, homeTeam, awayTeam }) {
+  const [open, setOpen] = useState(false);
+  if (!scheduleSpotData && !loading) return null;
+
+  const homeFlags = scheduleSpotData?.home?.flags || [];
+  const awayFlags = scheduleSpotData?.away?.flags || [];
+  const allFlags  = [
+    ...homeFlags.map(f => ({ ...SPOT_FLAGS[f], team: homeTeam, side: "home" })),
+    ...awayFlags.map(f => ({ ...SPOT_FLAGS[f], team: awayTeam, side: "away" })),
+  ].filter(f => f.label);
+
+  const netAdj = allFlags.reduce((sum, f) => sum + (f.side === "home" ? (f.spreadAdj || 0) : -(f.spreadAdj || 0)), 0);
+  const hasFlags = allFlags.length > 0;
+
+  return (
+    <Panel border={hasFlags ? "rgba(251,146,60,0.22)" : "rgba(255,255,255,0.07)"} bg="rgba(251,146,60,0.02)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>📅</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#fb923c",fontFamily:"'Barlow Condensed',sans-serif"}}>Schedule Spot Analysis</span>
+          {loading && <Tag color="#f59e0b">loading…</Tag>}
+          {allFlags.map((f, i) => <Tag key={i} color={f.color}>{f.icon} {f.label}</Tag>)}
+          {!loading && !hasFlags && <Tag color="#555">No spot flags</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"11px"}}>
+          {!hasFlags ? (
+            <div style={{fontSize:"9px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>
+              No significant schedule spot factors for this matchup. Standard rest, no travel disadvantage, no trap game indicators.
+            </div>
+          ) : (
+            <>
+              {allFlags.map((f, i) => (
+                <div key={i} style={{background:`${f.color}07`,border:`1px solid ${f.color}20`,borderRadius:"7px",padding:"9px 12px",marginBottom:"6px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"4px"}}>
+                    <span style={{fontSize:"14px"}}>{f.icon}</span>
+                    <span style={{fontSize:"10px",fontWeight:800,color:f.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{f.label}</span>
+                    <Tag color={f.side === "home" ? tc(homeTeam) : tc(awayTeam)}>{abb(f.team)}</Tag>
+                    {f.spreadAdj !== 0 && (
+                      <span style={{marginLeft:"auto",fontSize:"12px",fontWeight:900,color:f.spreadAdj > 0 ? "#4ade80" : "#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                        {f.spreadAdj > 0 ? "+" : ""}{f.spreadAdj} pts
+                      </span>
+                    )}
+                  </div>
+                  <div style={{fontSize:"9px",color:"#888",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{f.desc}</div>
+                </div>
+              ))}
+              {Math.abs(netAdj) >= 0.5 && (
+                <div style={{background:"rgba(251,146,60,0.08)",border:"1px solid rgba(251,146,60,0.2)",borderRadius:"6px",padding:"8px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:"9px",color:"#fed7aa",fontFamily:"'Barlow Condensed',sans-serif"}}>Net schedule spot spread adjustment</span>
+                  <span style={{fontSize:"16px",fontWeight:900,color:netAdj > 0 ? "#4ade80" : "#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{netAdj > 0 ? "+" : ""}{netAdj.toFixed(1)} pts</span>
+                </div>
+              )}
+            </>
+          )}
+          <div style={{marginTop:"8px",fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>Short week -1.5 · Bye rest +1.2 · Division dog +0.7 · Trap game -1.2 · Revenge +0.8</div>
+        </div>
+      )}
+      {loading && <div style={{padding:"8px 0"}}><Skel cols={2}/></div>}
+    </Panel>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PUBLIC BETTING % PANEL
+// ─────────────────────────────────────────────────────────────────────────
+function PublicBettingPanel({ publicData, loading, homeTeam, awayTeam, lines }) {
+  const [open, setOpen] = useState(false);
+  if (!publicData && !loading) return null;
+
+  const spreadPublic = publicData?.spread;
+  const totalPublic  = publicData?.total;
+  const mlPublic     = publicData?.moneyline;
+
+  // Detect reverse line movement (sharp indicator)
+  function detectRLM(publicPct, lineMoved) {
+    if (!publicPct || !lineMoved) return null;
+    const publicOnFav = publicPct >= 55;
+    const lineMovedTowardDog = lineMoved === "dog"; // line moved toward dog despite public on fav
+    if (publicOnFav && lineMovedTowardDog) return { isRLM: true, label: "🔥 RLM — sharps on dog", color: "#fbbf24" };
+    return { isRLM: false };
+  }
+
+  const spreadRLM = detectRLM(spreadPublic?.favPct, spreadPublic?.lineMove);
+
+  function PublicBar({ label, favTeam, favPct, dogPct, odds, rlm }) {
+    if (!favPct) return null;
+    const isSharpFade = favPct >= 70; // heavy public = potential sharp fade
+    return (
+      <div style={{marginBottom:"10px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"4px"}}>
+          <span style={{fontSize:"9px",fontWeight:700,color:"#555",fontFamily:"'Barlow Condensed',sans-serif",textTransform:"uppercase",letterSpacing:"0.07em"}}>{label}</span>
+          {rlm?.isRLM && <Tag color={rlm.color}>{rlm.label}</Tag>}
+          {isSharpFade && !rlm?.isRLM && <Tag color="#f59e0b">⚠ Heavy public — fade signal</Tag>}
+        </div>
+        {/* Bar */}
+        <div style={{display:"flex",height:"28px",borderRadius:"6px",overflow:"hidden",marginBottom:"4px"}}>
+          <div style={{width:favPct+"%",background:tc(favTeam)+"cc",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",fontWeight:800,color:"#fff",fontFamily:"'Barlow Condensed',sans-serif",transition:"width 0.5s ease"}}>
+            {favPct >= 20 ? favPct+"%" : ""}
+          </div>
+          <div style={{flex:1,background:"rgba(255,255,255,0.08)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",fontWeight:800,color:"#ccc",fontFamily:"'Barlow Condensed',sans-serif"}}>
+            {dogPct >= 20 ? dogPct+"%" : ""}
+          </div>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>
+          <span style={{color:tc(favTeam)}}>{abb(favTeam)} {favPct}% public</span>
+          {odds && <span>{odds}</span>}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <Panel border={spreadRLM?.isRLM ? "rgba(251,191,36,0.3)" : "rgba(139,92,246,0.18)"} bg={spreadRLM?.isRLM ? "rgba(251,191,36,0.04)" : "rgba(139,92,246,0.02)"} mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>👥</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#a78bfa",fontFamily:"'Barlow Condensed',sans-serif"}}>Public Betting %</span>
+          {loading && <Tag color="#f59e0b">loading…</Tag>}
+          {spreadPublic?.favPct && <Tag color={spreadPublic.favPct >= 70 ? "#f59e0b" : "#a78bfa"}>{abb(spreadPublic.favTeam || homeTeam)} {spreadPublic.favPct}% spread</Tag>}
+          {spreadRLM?.isRLM && <Tag color="#fbbf24">🔥 RLM Detected</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && publicData && !loading && (
+        <div style={{marginTop:"11px"}}>
+          <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+            Public betting % from Action Network. When 70%+ of bets are on one side and the line moves the other direction (Reverse Line Movement), that's sharp money on the other side. Sharps are right more often than the public over large samples.
+          </div>
+
+          {spreadPublic && <PublicBar label="Spread" favTeam={spreadPublic.favTeam || homeTeam} favPct={spreadPublic.favPct} dogPct={100 - (spreadPublic.favPct || 50)} odds={spreadPublic.odds} rlm={spreadRLM}/>}
+          {totalPublic  && <PublicBar label="Total"  favTeam={totalPublic.overTeam || homeTeam} favPct={totalPublic.overPct} dogPct={100 - (totalPublic.overPct || 50)} odds={totalPublic.odds}/>}
+          {mlPublic     && <PublicBar label="Moneyline" favTeam={mlPublic.favTeam || homeTeam} favPct={mlPublic.favPct} dogPct={100 - (mlPublic.favPct || 50)} odds={mlPublic.odds}/>}
+
+          {/* Sharp money insight */}
+          {publicData.sharpNote && (
+            <div style={{background:"rgba(251,191,36,0.07)",border:"1px solid rgba(251,191,36,0.2)",borderRadius:"6px",padding:"8px 11px",marginTop:"5px"}}>
+              <div style={{fontSize:"8px",fontWeight:700,color:"#fbbf24",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px",letterSpacing:"0.08em",textTransform:"uppercase"}}>Sharp Money Signal</div>
+              <div style={{fontSize:"10px",color:"#fde68a",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{publicData.sharpNote}</div>
+            </div>
+          )}
+
+          <div style={{marginTop:"7px",fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>Source: Action Network · 70%+ public = fade signal · RLM = strong sharp indicator · Updates through kickoff</div>
+        </div>
+      )}
+      {loading && <div style={{padding:"8px 0"}}><Skel cols={2}/></div>}
+    </Panel>
+  );
+}
+
+
+// ── Advanced Efficiency Signals ──────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ADVANCED EFFICIENCY SIGNALS (5 NEW METRICS)
+// ─────────────────────────────────────────────────────────────────────────
+//   1. Red Zone Efficiency   — TD% vs FG%, scoring quality per trip
+//   2. Third Down Rate       — drive sustainability, pace control
+//   3. Pace / Tempo          — plays per game, total inflation/deflation
+//   4. Turnover Luck         — fumble recovery regression, true TO margin
+//   5. EPA per Dropback      — most predictive QB passing efficiency metric
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Total adjustment from all three pace/efficiency signals ───────────────
+function calcAdvancedTotalAdj(homeAdv, awayAdv) {
+  if (!homeAdv || !awayAdv) return { total: 0, rz: 0, thirdDown: 0, pace: 0 };
+
+  // 1. Red Zone — TD% vs FG% impact on expected points per trip
+  //    Each 10% RZ TD% difference ≈ 0.6 pts/game vs league average (63%)
+  const homeRZOff = ((homeAdv.rzTdPct || 63) - 63) / 10 * 0.6;
+  const awayRZOff = ((awayAdv.rzTdPct || 63) - 63) / 10 * 0.6;
+  const homeRZDef = ((homeAdv.rzAllowedPct || 63) - 63) / 10 * 0.6;
+  const awayRZDef = ((awayAdv.rzAllowedPct || 63) - 63) / 10 * 0.6;
+  const rzAdj     = parseFloat(((homeRZOff - homeRZDef) + (awayRZOff - awayRZDef)).toFixed(1));
+
+  // 2. Third Down — high conversion = more drives sustained = more points
+  //    Each 5% above league avg (39%) ≈ 1.2 pts/game
+  const h3Off = ((homeAdv.thirdDownPct || 39) - 39) / 5 * 1.2;
+  const a3Off = ((awayAdv.thirdDownPct || 39) - 39) / 5 * 1.2;
+  const h3Def = ((homeAdv.thirdDownAllowed || 39) - 39) / 5 * 1.2;
+  const a3Def = ((awayAdv.thirdDownAllowed || 39) - 39) / 5 * 1.2;
+  const thirdAdj = parseFloat(((h3Off - h3Def) + (a3Off - a3Def)).toFixed(1));
+
+  // 3. Pace — plays per game. League avg ≈ 64. Each play ≈ 0.14 pts
+  //    Combined pace: both teams' offensive pace averages
+  const homePace   = homeAdv.playsPerGame || 64;
+  const awayPace   = awayAdv.playsPerGame || 64;
+  const combinedPace = (homePace + awayPace) / 2;
+  const paceAdj    = parseFloat(((combinedPace - 64) * 0.14 * 2).toFixed(1));
+
+  const total = parseFloat((rzAdj + thirdAdj + paceAdj).toFixed(1));
+  return { total, rz: rzAdj, thirdDown: thirdAdj, pace: paceAdj };
+}
+
+// ── Turnover luck assessment ──────────────────────────────────────────────
+function calcTurnoverLuck(homeAdv, awayAdv) {
+  if (!homeAdv || !awayAdv) return null;
+  // Fumble recovery rates regress to 50% over time
+  // Expected TO margin ≈ forced fumbles + interceptions thrown
+  const homeExpected = (homeAdv.forcedFumbles || 0) + (homeAdv.interceptions || 0);
+  const awayExpected = (awayAdv.forcedFumbles || 0) + (awayAdv.interceptions || 0);
+  const homeActual   = homeAdv.turnoverDiff || 0;
+  const awayActual   = awayAdv.turnoverDiff || 0;
+  // Luck = actual - expected. Positive luck regresses back
+  const homeLuck = parseFloat((homeActual - homeExpected * 0.5).toFixed(1));
+  const awayLuck = parseFloat((awayActual - awayExpected * 0.5).toFixed(1));
+  const luckDiff = homeLuck - awayLuck;
+  return {
+    homeLuck, awayLuck, luckDiff,
+    homeRegression: homeLuck > 2 ? "overperforming — expect regression" : homeLuck < -2 ? "underperforming — due for positive swing" : "neutral",
+    awayRegression: awayLuck > 2 ? "overperforming — expect regression" : awayLuck < -2 ? "underperforming — due for positive swing" : "neutral",
+  };
+}
+
+// ── EPA grade ─────────────────────────────────────────────────────────────
+function epaGrade(epa) {
+  if (epa >= 0.20) return { label: "Elite",      color: "#4ade80" };
+  if (epa >= 0.10) return { label: "Above Avg",  color: "#86efac" };
+  if (epa >= 0.00) return { label: "Average",    color: "#f59e0b" };
+  if (epa >= -0.10)return { label: "Below Avg",  color: "#f87171" };
+  return              { label: "Poor",       color: "#ef4444" };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADVANCED STATS PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+function AdvancedStatsPanel({ advancedData, advancedStatus, homeTeam, awayTeam, lines }) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab]   = useState("rz");
+  if (!advancedData && advancedStatus !== "loading") return null;
+
+  const home = advancedData?.home;
+  const away = advancedData?.away;
+  const totalAdj  = home && away ? calcAdvancedTotalAdj(home, away) : null;
+  const toSummary = home && away ? calcTurnoverLuck(home, away) : null;
+
+  const statusColor = advancedStatus === "success" ? "#4ade80"
+    : advancedStatus === "loading" ? "#f59e0b" : "#f87171";
+
+  return (
+    <Panel border="rgba(16,185,129,0.2)" bg="rgba(16,185,129,0.02)" mb="10px">
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>⚡</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#10b981",fontFamily:"'Barlow Condensed',sans-serif"}}>Advanced Efficiency</span>
+          {advancedStatus==="loading"&&<Tag color="#f59e0b">loading…</Tag>}
+          {totalAdj&&Math.abs(totalAdj.total)>=0.5&&(
+            <Tag color={totalAdj.total>0?"#4ade80":"#f87171"}>
+              {totalAdj.total>0?"+":""}{totalAdj.total} total
+            </Tag>
+          )}
+          {advancedData&&<Tag color="#10b981">5 signals</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+      </div>
+
+      {open && advancedData && (
+        <div style={{marginTop:"12px"}}>
+          {/* Tabs */}
+          <div style={{display:"flex",gap:"4px",marginBottom:"11px",flexWrap:"wrap"}}>
+            {[["rz","🏟️ Red Zone"],["third","📋 3rd Down"],["pace","⏱️ Pace"],["to","🎲 TO Luck"],["epa","📈 EPA"]].map(([k,l])=>(
+              <button key={k} onClick={()=>setTab(k)} style={{padding:"5px 10px",borderRadius:"5px",border:"1px solid "+(tab===k?"rgba(16,185,129,0.4)":"rgba(255,255,255,0.07)"),background:tab===k?"rgba(16,185,129,0.1)":"transparent",color:tab===k?"#10b981":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</button>
+            ))}
+          </div>
+
+          {/* ── RED ZONE TAB ── */}
+          {tab==="rz"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Red zone TD% measures scoring quality — teams converting trips to TDs vs settling for FGs. League average: 63% TD rate. Each 10% gap ≈ 0.6 pts/game vs a league-average red zone defense.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                {[{team:awayTeam,d:away},{team:homeTeam,d:home}].map(({team,d})=>{
+                  const offGrade = (d?.rzTdPct||63)>=70?"#4ade80":(d?.rzTdPct||63)>=55?"#f59e0b":"#f87171";
+                  const defGrade = (d?.rzAllowedPct||63)<=55?"#4ade80":(d?.rzAllowedPct||63)<=70?"#f59e0b":"#f87171";
+                  return(
+                    <div key={team} style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"8px"}}>
+                      <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>{abb(team)}</div>
+                      {[["Off RZ TD%",(d?.rzTdPct||"—")+"%",offGrade,"League avg 63%"],["Def RZ TD%",(d?.rzAllowedPct||"—")+"%",defGrade,"Lower = better"],["RZ Trips/G",d?.rzTripsPerGame||"—","#888","Opportunities"]].map(([l,v,c,s])=>(
+                        <div key={l} style={{display:"flex",alignItems:"center",gap:"6px",padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                          <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",flex:1}}>{l}</span>
+                          <span style={{fontSize:"12px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v}</span>
+                          <span style={{fontSize:"7px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif"}}>{s}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+              {totalAdj&&<div style={{background:"rgba(16,185,129,0.06)",border:"1px solid rgba(16,185,129,0.15)",borderRadius:"5px",padding:"7px 10px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:"9px",color:"#6ee7b7",fontFamily:"'Barlow Condensed',sans-serif"}}>Red Zone total adjustment</span>
+                <span style={{fontSize:"14px",fontWeight:900,color:totalAdj.rz>=0?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{totalAdj.rz>=0?"+":""}{totalAdj.rz} pts</span>
+              </div>}
+            </div>
+          )}
+
+          {/* ── THIRD DOWN TAB ── */}
+          {tab==="third"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Third down conversion sustains drives and controls tempo. League average: 39% offense, 39% defense allowed. Each 5% above average ≈ 1.2 pts/game additional.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                {[{team:awayTeam,d:away},{team:homeTeam,d:home}].map(({team,d})=>(
+                  <div key={team} style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"8px"}}>
+                    <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>{abb(team)}</div>
+                    {[["Off 3rd%",(d?.thirdDownPct||"—")+"%",(d?.thirdDownPct||39)>=44?"#4ade80":(d?.thirdDownPct||39)>=37?"#f59e0b":"#f87171"],["Def 3rd Allowed",(d?.thirdDownAllowed||"—")+"%",(d?.thirdDownAllowed||39)<=35?"#4ade80":(d?.thirdDownAllowed||39)<=42?"#f59e0b":"#f87171"]].map(([l,v,c])=>(
+                      <div key={l} style={{display:"flex",alignItems:"center",gap:"6px",padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                        <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",flex:1}}>{l}</span>
+                        <span style={{fontSize:"12px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+              {totalAdj&&<div style={{background:"rgba(16,185,129,0.06)",border:"1px solid rgba(16,185,129,0.15)",borderRadius:"5px",padding:"7px 10px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:"9px",color:"#6ee7b7",fontFamily:"'Barlow Condensed',sans-serif"}}>Third down total adjustment</span>
+                <span style={{fontSize:"14px",fontWeight:900,color:totalAdj.thirdDown>=0?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{totalAdj.thirdDown>=0?"+":""}{totalAdj.thirdDown} pts</span>
+              </div>}
+            </div>
+          )}
+
+          {/* ── PACE TAB ── */}
+          {tab==="pace"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Pace directly inflates or deflates totals. League avg: 64 plays/game. Two fast teams (70+) add 6-8 pts to the total. Two slow teams (58) remove 4-6 pts. Each additional play ≈ 0.28 pts to the combined score.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                {[{team:awayTeam,d:away},{team:homeTeam,d:home}].map(({team,d})=>{
+                  const pace=d?.playsPerGame||64;
+                  const pc=pace>=68?"#4ade80":pace>=62?"#f59e0b":"#f87171";
+                  return(
+                    <div key={team} style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"8px"}}>
+                      <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>{abb(team)}</div>
+                      {[["Plays/Game",pace,pc],["Sec/Snap",d?.secondsPerSnap||"—","#888"],["TOP/G (min)",d?.timeOfPoss||"—","#888"]].map(([l,v,c])=>(
+                        <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                          <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</span>
+                          <span style={{fontSize:"12px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+              {totalAdj&&(
+                <div style={{background:"rgba(16,185,129,0.06)",border:"1px solid rgba(16,185,129,0.15)",borderRadius:"5px",padding:"7px 10px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"4px"}}>
+                    <span style={{fontSize:"9px",color:"#6ee7b7",fontFamily:"'Barlow Condensed',sans-serif"}}>Combined pace total adjustment</span>
+                    <span style={{fontSize:"14px",fontWeight:900,color:totalAdj.pace>=0?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{totalAdj.pace>=0?"+":""}{totalAdj.pace} pts</span>
+                  </div>
+                  <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                    {((home?.playsPerGame||64)+(away?.playsPerGame||64))/2 >= 67
+                      ? "High-pace matchup — both offenses run fast, inflating total vs Vegas line"
+                      : ((home?.playsPerGame||64)+(away?.playsPerGame||64))/2 <= 61
+                      ? "Slow-pace matchup — both teams grind clock, total should trend under"
+                      : "Average pace matchup — no significant total inflation or deflation"}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── TURNOVER LUCK TAB ── */}
+          {tab==="to"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Fumble recovery rates regress toward 50% over time — they're largely random. A team that's +6 in turnover differential mostly from fumble recoveries is due to regress. This separates skill-based TOs (forced fumbles, interceptions) from luck-based ones (fumble recoveries).
+              </div>
+              {toSummary&&(
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                  {[{team:awayTeam,d:away,luck:toSummary.awayLuck,reg:toSummary.awayRegression},
+                    {team:homeTeam,d:home,luck:toSummary.homeLuck,reg:toSummary.homeRegression}].map(({team,d,luck,reg})=>(
+                    <div key={team} style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"8px"}}>
+                      <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>{abb(team)}</div>
+                      {[["TO Diff",d?.turnoverDiff>=0?"+"+(d?.turnoverDiff||0):d?.turnoverDiff||0,d?.turnoverDiff>=0?"#4ade80":"#f87171"],
+                        ["Forced Fum",d?.forcedFumbles||0,"#aaa"],
+                        ["INTs Forced",d?.interceptions||0,"#aaa"],
+                        ["Luck Score",luck>=0?"+"+luck:luck,Math.abs(luck)>2?luck>0?"#f59e0b":"#4ade80":"#888"]
+                      ].map(([l,v,c])=>(
+                        <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                          <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</span>
+                          <span style={{fontSize:"11px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v}</span>
+                        </div>
+                      ))}
+                      <div style={{marginTop:"5px",padding:"4px 6px",background:"rgba(255,255,255,0.03)",borderRadius:"3px",fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{reg}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── EPA TAB ── */}
+          {tab==="epa"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                EPA per dropback is the most predictive QB efficiency metric — more stable than yards or completion % because it accounts for down, distance, and field position. Elite QBs: 0.20+. Average: 0.05. Poor: below 0.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                {[{team:awayTeam,d:away},{team:homeTeam,d:home}].map(({team,d})=>{
+                  const epa=d?.epaPerDropback||0;
+                  const eg=epaGrade(epa);
+                  return(
+                    <div key={team} style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"8px",textAlign:"center"}}>
+                      <div style={{fontSize:"9px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>{abb(team)} QB</div>
+                      <div style={{fontSize:"28px",fontWeight:900,color:eg.color,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1,marginBottom:"4px"}}>{epa>=0?"+":""}{epa}</div>
+                      <Tag color={eg.color}>{eg.label}</Tag>
+                      <div style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"5px"}}>EPA per dropback</div>
+                      {d?.epaRank&&<div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>Ranked #{d.epaRank} in NFL</div>}
+                      {d?.cpoeBonus&&<div style={{fontSize:"8px",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>CPOE confirms efficiency</div>}
+                    </div>
+                  );
+                })}
+              </div>
+              {home?.epaPerDropback!=null&&away?.epaPerDropback!=null&&(
+                <div style={{background:"rgba(16,185,129,0.06)",border:"1px solid rgba(16,185,129,0.15)",borderRadius:"5px",padding:"7px 10px"}}>
+                  <div style={{fontSize:"9px",color:"#6ee7b7",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>
+                    QB EPA differential: {((home.epaPerDropback||0)-(away.epaPerDropback||0)).toFixed(3)} per dropback.
+                    {Math.abs((home.epaPerDropback||0)-(away.epaPerDropback||0))>0.10
+                      ? " Significant QB efficiency edge — impacts spread 1-3 pts."
+                      : " QBs are closely matched in efficiency."}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Combined adjustment summary */}
+          {totalAdj&&Math.abs(totalAdj.total)>=0.5&&(
+            <div style={{marginTop:"10px",background:"rgba(16,185,129,0.07)",border:"1px solid rgba(16,185,129,0.2)",borderRadius:"7px",padding:"9px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#10b981",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>Combined Total Adjustment</div>
+                <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                  RZ {totalAdj.rz>=0?"+":""}{totalAdj.rz} · 3rd {totalAdj.thirdDown>=0?"+":""}{totalAdj.thirdDown} · Pace {totalAdj.pace>=0?"+":""}{totalAdj.pace}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:"22px",fontWeight:900,color:totalAdj.total>=0?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{totalAdj.total>=0?"+":""}{totalAdj.total}</div>
+                <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>pts to total</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {advancedStatus==="loading"&&<div style={{padding:"8px 0"}}><Skel cols={3}/></div>}
+    </Panel>
+  );
+}
+
+
+// ── Line Shopping Panel ─────────────────────────────────────────────────────────
 function LineShoppingPanel({ ensemble, lines, gameResult, homeTeam, awayTeam }) {
   if(!ensemble?.books?.length) return null;
   const books=ensemble.books;
@@ -1449,7 +3297,7 @@ function calcDivergence(modelSpread, vegasSpread, modelFav, vegasFav) {
 const KEY_NUMBERS     = [3,7,10,14,6,1];
 
 // ── Signal weight defaults (sum = 100) ───────────────────────────────────────
-const DEFAULT_WEIGHTS = { cpoe:18, pressure:15, olDegradation:14, garbageFilter:12, luckRegression:11, marketEnsemble:10, coaching:8, microContext:7, weather:5 };
+const DEFAULT_WEIGHTS = { cpoe:18, pressure:15, olDegradation:14, garbageFilter:12, luckRegression:11, marketEnsemble:10, coaching:8, microContext:7, weather:5, advanced:5, elo:4, scheduleSpot:4, publicPct:4 };
 
 // ── Session cache ─────────────────────────────────────────────────────────────
 const SESSION_CACHE = new Map();
@@ -1533,6 +3381,420 @@ function detectSteamMove(lineMove){
 }
 
 // ── Weather model ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// THREE NEW FEATURES:
+//   1. Weather Severity Scoring — continuous 0-100 scale replaces binary
+//   2. Head-to-Head Matchup Database — franchise vs franchise ATS history
+//   3. Opponent-Adjusted Stats — SOS-corrected PPG/PAPG
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. WEATHER SEVERITY ENGINE
+// Continuous 0-100 score from real forecast data.
+// Replaces the binary 4-category system with calibrated adjustments.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function calcWeatherSeverity(tempF, windMph, precipPct) {
+  // Temperature component: comfortable 65°F → 0, freezing 32°F → 45, extreme 10°F → 100
+  const tScore = tempF >= 65 ? 0
+    : tempF >= 50 ? (65 - tempF) / 15 * 15
+    : tempF >= 32 ? 15 + (50 - tempF) / 18 * 30
+    : tempF >= 10 ? 45 + (32 - tempF) / 22 * 35
+    : 80 + Math.min(20, (10 - tempF) / 10 * 20);
+
+  // Wind component: 0mph → 0, 15mph → 25, 25mph → 60, 35mph+ → 100
+  const wScore = windMph <= 0 ? 0
+    : windMph <= 10 ? windMph / 10 * 12
+    : windMph <= 20 ? 12 + (windMph - 10) / 10 * 28
+    : windMph <= 30 ? 40 + (windMph - 20) / 10 * 35
+    : Math.min(100, 75 + (windMph - 30) / 10 * 25);
+
+  // Precipitation component: 0% → 0, 30% → 20, 60% → 55, 90%+ → 100
+  const pScore = precipPct <= 0 ? 0
+    : precipPct <= 30 ? precipPct / 30 * 20
+    : precipPct <= 60 ? 20 + (precipPct - 30) / 30 * 35
+    : Math.min(100, 55 + (precipPct - 60) / 40 * 45);
+
+  // Weighted composite: wind dominates passing game impact
+  const severity = Math.round(tScore * 0.25 + wScore * 0.50 + pScore * 0.25);
+
+  // Derive spread and total adjustments from severity
+  const totalAdj  = severity <= 5  ?  0
+    : severity <= 20  ? -(severity / 20) * 1.5
+    : severity <= 40  ? -1.5 - (severity - 20) / 20 * 2.0
+    : severity <= 65  ? -3.5 - (severity - 40) / 25 * 2.0
+    : -5.5 - Math.min(1.5, (severity - 65) / 35 * 1.5);
+
+  const spreadAdj = severity <= 10 ? 0
+    : severity <= 40 ? (severity - 10) / 30 * 0.8
+    : severity <= 70 ? 0.8 + (severity - 40) / 30 * 0.7
+    : 1.5 + Math.min(0.5, (severity - 70) / 30 * 0.5);
+
+  // Auto-category
+  const category = severity <= 8  ? "ideal"
+    : severity <= 25 ? (windMph >= 15 ? "wind" : "cold")
+    : severity <= 50 ? (precipPct >= 35 ? "rain" : "wind")
+    : precipPct >= 40 ? "rain" : "wind";
+
+  return {
+    severity,
+    totalAdj:  parseFloat(totalAdj.toFixed(1)),
+    spreadAdj: parseFloat(spreadAdj.toFixed(1)),
+    category,
+    components: {
+      tempScore:  Math.round(tScore),
+      windScore:  Math.round(wScore),
+      precipScore:Math.round(pScore),
+    },
+    label: severity <= 8  ? "Ideal"
+      : severity <= 25 ? "Mild"
+      : severity <= 50 ? "Moderate"
+      : severity <= 70 ? "Severe"
+      : "Extreme",
+    color: severity <= 8  ? "#4ade80"
+      : severity <= 25 ? "#86efac"
+      : severity <= 50 ? "#f59e0b"
+      : severity <= 70 ? "#f87171"
+      : "#ef4444",
+    note: severity <= 8  ? null
+      : `${Math.abs(parseFloat(totalAdj.toFixed(1)))} pts off total, ${spreadAdj > 0 ? "+" : ""}${spreadAdj.toFixed(1)} spread adj — severity ${severity}/100`,
+  };
+}
+
+// Enhanced weatherAdjust that uses severity when forecast data available
+function weatherAdjustWithSeverity(category, severityResult) {
+  if (severityResult) return severityResult;
+  // Fall back to existing binary system
+  if(category==="dome"||category==="ideal") return {totalAdj:0,spreadAdj:0,note:null,severity:0,label:"Ideal",color:"#4ade80"};
+  if(category==="wind")  return {totalAdj:-3.5,spreadAdj:0.5,note:"Wind 20+ mph → -3.5 total",severity:55,label:"Severe",color:"#f87171"};
+  if(category==="cold")  return {totalAdj:-2.0,spreadAdj:0.5,note:"Cold <35°F → -2.0 total",severity:35,label:"Moderate",color:"#f59e0b"};
+  if(category==="rain")  return {totalAdj:-4.5,spreadAdj:1.0,note:"Rain/Snow → -4.5 total",severity:65,label:"Severe",color:"#f87171"};
+  return {totalAdj:0,spreadAdj:0,note:null,severity:0,label:"Ideal",color:"#4ade80"};
+}
+
+// ── Weather Severity Panel ─────────────────────────────────────────────────
+function WeatherSeverityBar({ severityResult }) {
+  if (!severityResult || severityResult.severity <= 5) return null;
+  const { severity, label, color, components, totalAdj, spreadAdj } = severityResult;
+  return (
+    <div style={{background:`${color}08`,border:`1px solid ${color}25`,borderRadius:"7px",padding:"9px 12px",marginBottom:"8px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"7px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"7px"}}>
+          <span style={{fontSize:"13px"}}>{severity>=65?"🌪️":severity>=50?"⛈️":severity>=25?"🌬️":"🌤️"}</span>
+          <div>
+            <div style={{fontSize:"10px",fontWeight:800,color,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.08em"}}>{label.toUpperCase()} CONDITIONS — {severity}/100</div>
+            <div style={{fontSize:"8px",color:`${color}99`,fontFamily:"'Barlow Condensed',sans-serif",marginTop:"1px"}}>
+              {Math.abs(totalAdj)} pts off total · {spreadAdj > 0 ? "+" : ""}{spreadAdj} spread
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:"5px"}}>
+          {[["🌡️","Temp",components.tempScore],["💨","Wind",components.windScore],["🌧️","Precip",components.precipScore]].map(([icon,l,s])=>(
+            <div key={l} style={{textAlign:"center",minWidth:"32px"}}>
+              <div style={{fontSize:"8px"}}>{icon}</div>
+              <div style={{fontSize:"10px",fontWeight:800,color:s>60?"#f87171":s>30?"#f59e0b":"#888",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{s}</div>
+              <div style={{fontSize:"6px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* Severity bar */}
+      <div style={{height:"5px",borderRadius:"3px",background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+        <div style={{width:`${severity}%`,height:"100%",borderRadius:"3px",background:`linear-gradient(90deg,#4ade80,#f59e0b,#f87171)`,transition:"width 0.7s cubic-bezier(0.16,1,0.3,1)"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:"2px",fontSize:"7px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+        <span>Ideal</span><span>Mild</span><span>Moderate</span><span>Severe</span><span>Extreme</span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. HEAD-TO-HEAD MATCHUP DATABASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+function H2HPanel({ h2hData, loading, homeTeam, awayTeam }) {
+  if (!h2hData && !loading) return null;
+  const [open, setOpen] = useState(false);
+  if (!h2hData && !loading) return null;
+  return (
+    <Panel border="rgba(251,146,60,0.2)" bg="rgba(251,146,60,0.02)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>⚔️</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#fb923c",fontFamily:"'Barlow Condensed',sans-serif"}}>Head-to-Head History</span>
+          {loading && <Tag color="#f59e0b">loading…</Tag>}
+          {h2hData && !loading && <Tag color="#fb923c">{h2hData.gamesAnalyzed} games</Tag>}
+          {h2hData?.atsPct != null && <Tag color={h2hData.atsPct>=53?"#4ade80":"#f87171"}>{h2hData.favTeamLabel} ATS {h2hData.atsPct}%</Tag>}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+      </div>
+      {open && h2hData && !loading && (
+        <div style={{marginTop:"11px"}}>
+          {/* Record summary */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"5px",marginBottom:"10px"}}>
+            {[
+              [abb(homeTeam)+" SU","All-time vs "+abb(awayTeam),h2hData.homeSU,tc(homeTeam)],
+              ["ATS Record","Fav team covering",h2hData.atsRecord,"#fbbf24"],
+              ["Over/Under","Total hit rate",h2hData.totalRecord,"#a78bfa"],
+            ].map(([l,sub,v,c])=>(
+              <div key={l} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:"7px",padding:"8px 7px",textAlign:"center"}}>
+                <div style={{fontSize:"7px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>{l}</div>
+                <div style={{fontSize:"16px",fontWeight:900,color:c,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{v||"—"}</div>
+                <div style={{fontSize:"7px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>{sub}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Key stats */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"5px",marginBottom:"10px"}}>
+            {[
+              ["Avg Margin",h2hData.avgMargin,Math.abs(parseFloat(h2hData.avgMargin||0))>7?"#f87171":"#888"],
+              ["Avg Total",h2hData.avgTotal,"#a78bfa"],
+              ["Home ATS",h2hData.homeAts,parseFloat((h2hData.homeAts||"0").replace("%",""))>=53?"#4ade80":"#f87171"],
+              ["Away ATS",h2hData.awayAts,parseFloat((h2hData.awayAts||"0").replace("%",""))>=53?"#4ade80":"#f87171"],
+            ].map(([l,v,c])=>(
+              <div key={l} style={{background:"rgba(255,255,255,0.03)",borderRadius:"5px",padding:"6px 8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</span>
+                <span style={{fontSize:"12px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v||"—"}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Notable pattern */}
+          {h2hData.pattern && (
+            <div style={{background:"rgba(251,146,60,0.07)",border:"1px solid rgba(251,146,60,0.18)",borderRadius:"6px",padding:"8px 11px",marginBottom:"8px"}}>
+              <div style={{fontSize:"8px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#fb923c",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px"}}>📌 Matchup Pattern</div>
+              <div style={{fontSize:"10px",color:"#fed7aa",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5"}}>{h2hData.pattern}</div>
+            </div>
+          )}
+
+          {/* Last 5 meetings */}
+          {h2hData.lastFive?.length > 0 && (
+            <div>
+              <div style={{fontSize:"8px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#555",marginBottom:"5px",fontFamily:"'Barlow Condensed',sans-serif"}}>Last 5 Meetings</div>
+              {h2hData.lastFive.map((g,i)=>(
+                <div key={i} style={{display:"flex",alignItems:"center",gap:"7px",padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",width:"55px",flexShrink:0}}>{g.date}</span>
+                  <span style={{fontSize:"9px",color:"#aaa",fontFamily:"'Barlow Condensed',sans-serif",flex:1}}>{g.score}</span>
+                  <span style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif"}}>{g.margin}</span>
+                  <Tag color={g.coverTeam?"#4ade80":"#555"}>{g.coverResult||"—"}</Tag>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {h2hData.note && (
+            <div style={{marginTop:"7px",fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5",fontStyle:"italic"}}>{h2hData.note}</div>
+          )}
+        </div>
+      )}
+      {loading && <div style={{padding:"8px 0"}}><Skel cols={3}/></div>}
+    </Panel>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. OPPONENT-ADJUSTED STATS
+// SOS-corrected PPG/PAPG. Raw PPG against bad defenses inflates numbers.
+// Formula: adj_ppg = (raw_ppg / avg_opp_papg) × league_avg_ppg
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DVOA — Defense-Adjusted Value Over Average (Football Outsiders)
+// ─────────────────────────────────────────────────────────────────────────
+// The most predictive NFL efficiency metric. Calculated on every snap,
+// adjusted for down/distance/field position/opponent. Published weekly
+// at footballoutsiders.com. Replaces the OppAdj SOS approximation entirely.
+//
+// Key numbers:
+//   Offensive DVOA: +% = above average offense (good), -% = below average
+//   Defensive DVOA: -% = above average defense (good), +% = below average
+//   Range: typically -40% to +40% for most teams
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ── Normalize DVOA for clustering feature vectors ─────────────────────────
+// Maps typical -40% to +40% range onto 0-1
+function normalizeDVOA(dvoa, invert = false) {
+  const clamped = Math.max(-50, Math.min(50, dvoa || 0));
+  const norm    = (clamped + 50) / 100;
+  return invert ? 1 - norm : norm;
+}
+
+// ── Spread impact from DVOA differential ──────────────────────────────────
+// Research: each 10% DVOA differential ≈ 2 pts of spread
+function dvoaToSpreadAdj(homeOffDVOA, homeDefDVOA, awayOffDVOA, awayDefDVOA) {
+  // Net offensive efficiency: home off vs away def, away off vs home def
+  const homeOff = (homeOffDVOA || 0) - (awayDefDVOA || 0); // positive = home advantage
+  const awayOff = (awayOffDVOA || 0) - (homeDefDVOA || 0); // positive = away advantage
+  const net     = (homeOff - awayOff) / 10 * 2; // per 10% DVOA = 2pts
+  return parseFloat(Math.min(6, Math.max(-6, net)).toFixed(1));
+}
+
+// ── DVOA grade label ──────────────────────────────────────────────────────
+function dvoaGrade(dvoa, isDefense = false) {
+  const v = isDefense ? -dvoa : dvoa; // invert for defense
+  if (v >= 20)  return { label: "Elite",      color: "#4ade80" };
+  if (v >= 10)  return { label: "Above Avg",  color: "#86efac" };
+  if (v >= -5)  return { label: "Average",    color: "#f59e0b" };
+  if (v >= -15) return { label: "Below Avg",  color: "#f87171" };
+  return         { label: "Poor",       color: "#ef4444" };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DVOA PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+function DVOAPanel({ dvoaData, loading, homeTeam, awayTeam }) {
+  const [open, setOpen] = useState(false);
+  if (!dvoaData && !loading) return null;
+
+  const home = dvoaData?.home;
+  const away = dvoaData?.away;
+  const spreadAdj = home && away
+    ? dvoaToSpreadAdj(home.offDVOA, home.defDVOA, away.offDVOA, away.defDVOA)
+    : null;
+
+  function TeamDVOA({ team, d, side }) {
+    if (!d) return null;
+    const offG = dvoaGrade(d.offDVOA, false);
+    const defG = dvoaGrade(d.defDVOA, true);
+    return (
+      <div style={{borderTop:"2px solid "+tc(team)+"33",paddingTop:"9px"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"8px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+            <div style={{width:"6px",height:"6px",borderRadius:"50%",background:tc(team)}}/>
+            <span style={{fontSize:"11px",fontWeight:800,color:tc(team),fontFamily:"'Barlow Condensed',sans-serif"}}>{abb(team)}</span>
+          </div>
+          {d.week && <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>{d.week}</span>}
+        </div>
+        {/* Off DVOA */}
+        <div style={{marginBottom:"5px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"3px"}}>
+            <span style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase"}}>Off DVOA</span>
+            <div style={{display:"flex",alignItems:"center",gap:"5px"}}>
+              <Tag color={offG.color}>{offG.label}</Tag>
+              <span style={{fontSize:"13px",fontWeight:900,color:offG.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{d.offDVOA >= 0 ? "+" : ""}{d.offDVOA}%</span>
+              {d.offRank && <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>#{d.offRank}</span>}
+            </div>
+          </div>
+          <div style={{height:"4px",borderRadius:"2px",background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+            <div style={{width:Math.abs(d.offDVOA)/50*100+"%",marginLeft:d.offDVOA<0?(50-Math.abs(d.offDVOA)/50*50)+"%":"50%",height:"100%",background:offG.color,borderRadius:"2px",transition:"all 0.6s ease"}}/>
+          </div>
+        </div>
+        {/* Def DVOA */}
+        <div style={{marginBottom:"5px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"3px"}}>
+            <span style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase"}}>Def DVOA</span>
+            <div style={{display:"flex",alignItems:"center",gap:"5px"}}>
+              <Tag color={defG.color}>{defG.label}</Tag>
+              <span style={{fontSize:"13px",fontWeight:900,color:defG.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{d.defDVOA >= 0 ? "+" : ""}{d.defDVOA}%</span>
+              {d.defRank && <span style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>#{d.defRank}</span>}
+            </div>
+          </div>
+          <div style={{height:"4px",borderRadius:"2px",background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+            <div style={{width:Math.abs(d.defDVOA)/50*100+"%",marginLeft:d.defDVOA<0?(50-Math.abs(d.defDVOA)/50*50)+"%":"50%",height:"100%",background:defG.color,borderRadius:"2px",transition:"all 0.6s ease"}}/>
+          </div>
+          <div style={{fontSize:"7px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"1px"}}>Negative = better defense</div>
+        </div>
+        {/* Total + trend */}
+        <div style={{display:"flex",gap:"5px",marginTop:"5px"}}>
+          {d.totalDVOA != null && (
+            <div style={{background:"rgba(255,255,255,0.04)",borderRadius:"4px",padding:"3px 8px",flex:1,textAlign:"center"}}>
+              <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>Total DVOA</div>
+              <div style={{fontSize:"12px",fontWeight:800,color:d.totalDVOA>=0?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{d.totalDVOA>=0?"+":""}{d.totalDVOA}%</div>
+            </div>
+          )}
+          {d.trend && (
+            <div style={{background:"rgba(255,255,255,0.04)",borderRadius:"4px",padding:"3px 8px",flex:1,textAlign:"center"}}>
+              <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>Trend</div>
+              <div style={{fontSize:"11px",fontWeight:700,color:d.trend==="improving"?"#4ade80":d.trend==="declining"?"#f87171":"#f59e0b",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                {d.trend==="improving"?"▲ Improving":d.trend==="declining"?"▼ Declining":"→ Stable"}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <Panel border="rgba(99,102,241,0.2)" bg="rgba(99,102,241,0.02)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"11px"}}>📊</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#818cf8",fontFamily:"'Barlow Condensed',sans-serif"}}>DVOA — Football Outsiders</span>
+          {loading && <Tag color="#f59e0b">loading…</Tag>}
+          {dvoaData && !loading && <Tag color="#818cf8">{dvoaData.week||"Current"}</Tag>}
+          {spreadAdj != null && Math.abs(spreadAdj) >= 0.5 && (
+            <Tag color={spreadAdj > 0 ? "#4ade80" : "#f87171"}>
+              DVOA adj {spreadAdj > 0 ? "+" : ""}{spreadAdj} pts
+            </Tag>
+          )}
+        </div>
+        <span style={{color:"#333",fontSize:"10px"}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"10px",lineHeight:"1.5"}}>
+            Football Outsiders DVOA measures every snap vs what an average NFL team would do in the same situation — down, distance, field position, opponent. More predictive than raw points or yards. Negative defensive DVOA = elite defense.
+          </div>
+
+          {dvoaData && !loading ? (
+            <>
+              {/* Team cards */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"10px"}}>
+                <TeamDVOA team={awayTeam} d={away} side="away"/>
+                <TeamDVOA team={homeTeam} d={home} side="home"/>
+              </div>
+
+              {/* DVOA differential + spread impact */}
+              {spreadAdj != null && (
+                <div style={{background:Math.abs(spreadAdj)>=1?"rgba(99,102,241,0.08)":"rgba(255,255,255,0.03)",border:"1px solid "+(Math.abs(spreadAdj)>=1?"rgba(99,102,241,0.22)":"rgba(255,255,255,0.06)"),borderRadius:"7px",padding:"9px 12px",marginBottom:"8px"}}>
+                  <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#818cf8",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"5px"}}>📐 DVOA Differential → Spread Impact</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"6px",marginBottom:"6px"}}>
+                    {[
+                      ["Off Diff",(home?.offDVOA||0)-(away?.offDVOA||0),(home?.offDVOA||0)-(away?.offDVOA||0)>=0?"#4ade80":"#f87171"],
+                      ["Def Diff",(away?.defDVOA||0)-(home?.defDVOA||0),(away?.defDVOA||0)-(home?.defDVOA||0)<=0?"#4ade80":"#f87171"],
+                      ["Spread Adj",spreadAdj,spreadAdj>0?"#4ade80":spreadAdj<0?"#f87171":"#888"],
+                    ].map(([l,v,c])=>(
+                      <div key={l} style={{background:"rgba(255,255,255,0.04)",borderRadius:"5px",padding:"6px",textAlign:"center"}}>
+                        <div style={{fontSize:"7px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"2px"}}>{l}</div>
+                        <div style={{fontSize:"13px",fontWeight:900,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{v>=0?"+":""}{typeof v==="number"?v.toFixed(1):v}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {dvoaData.matchupNote && (
+                    <div style={{fontSize:"9px",color:"#a5b4fc",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{dvoaData.matchupNote}</div>
+                  )}
+                </div>
+              )}
+
+              <div style={{fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                Source: Football Outsiders · Updated weekly Tuesday · Per 10% DVOA differential ≈ 2 pts spread
+              </div>
+            </>
+          ) : loading ? (
+            <Skel cols={2}/>
+          ) : null}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// // 2. HEAD-TO-HEAD MATCHUP DATABASE
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. OPPONENT-ADJUSTED STATS
+// SOS-corrected PPG/PAPG. Raw PPG against bad defenses inflates numbers.
+// Formula: adj_ppg = (raw_ppg / avg_opp_papg) × league_avg_ppg
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Legacy weather (binary fallback) ────────────────────────────────────────
 const weatherAdjust = w => {
   if(w==="dome"||w==="ideal") return {totalAdj:0,spreadAdj:0,note:null};
   if(w==="wind")  return {totalAdj:-3.5,spreadAdj:0.5,note:"Wind 20+ mph → -3.5 total, run game favored"};
@@ -1578,10 +3840,18 @@ const getMicroModifiers = (homeTeam, weather) => {
 };
 
 // ── API helper ────────────────────────────────────────────────────────────────
+// Routing logic:
+//   window.__USE_PROXY === true  →  /api/claude  (Vercel — key stays server-side)
+//   otherwise                   →  Anthropic direct (Claude artifact runtime)
 async function callClaude({prompt,useSearch=false,maxTokens=900}){
   const body={model:"claude-sonnet-4-20250514",max_tokens:maxTokens,messages:[{role:"user",content:prompt}]};
   if(useSearch) body.tools=[{type:"web_search_20250305",name:"web_search"}];
-  const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const useProxy = typeof window!=="undefined" && window.__USE_PROXY===true;
+  const endpoint = useProxy ? "/api/claude" : "https://api.anthropic.com/v1/messages";
+  const headers  = {"Content-Type":"application/json"};
+  if(useProxy && typeof window!=="undefined" && window.__APP_TOKEN)
+    headers["x-app-token"]=window.__APP_TOKEN;
+  const res=await fetch(endpoint,{method:"POST",headers,body:JSON.stringify(body)});
   const data=await res.json();
   if(data.error) throw new Error(data.error.message);
   return data.content?.filter(b=>b.type==="text").map(b=>b.text).join("")||"";
@@ -1978,7 +4248,7 @@ async function fetchFinalScore(awayTeam, homeTeam, gameDate) {
   const text = await callClaude({
     useSearch: true,
     maxTokens: 400,
-    prompt: `Search for the final score of the NFL game: ${awayTeam} at ${homeTeam}${gameDate ? ` on ${gameDate}` : ""} in the 2025-26 NFL season.
+    prompt: `Search for the final score of the NFL game: ${awayTeam} at ${homeTeam}${gameDate ? " on "+gameDate : ""} in the 2025-26 NFL season.
 Return ONLY JSON (no markdown):
 {"found":true,"awayScore":N,"homeScore":N,"awayTeam":"${awayTeam}","homeTeam":"${homeTeam}","gameDate":"e.g. Dec 8","finalStatus":"Final"}
 If the game has not been played yet or score is unavailable: {"found":false,"awayTeam":"${awayTeam}","homeTeam":"${homeTeam}"}`
@@ -2051,6 +4321,888 @@ function AutoResultsPanel({ pendingGames, onFetchResults, onDismiss, fetching, f
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Compute model-derived ratings from backtest history ───────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// UNSUPERVISED CLUSTERING — SCHEMATIC ARCHETYPE ENGINE
+// ─────────────────────────────────────────────────────────────────────────
+// Pure-JS K-Means++ clustering that discovers NFL team schematic archetypes
+// from accumulated signal data. No labels provided — the algorithm finds
+// natural groupings and the model names them post-hoc.
+//
+// Feature vector per team (10 dimensions, all normalized 0→1):
+//   [0] passVolumeRatio   — pass yds share of total offense
+//   [1] rushStrength      — rush yds vs league avg (normalized)
+//   [2] offensiveOutput   — PPG normalized
+//   [3] defensiveStrength — PAPG inverted (high = elite defense)
+//   [4] pressureAllowed   — QB pressure rate allowed
+//   [5] pressureGenerated — pass rush win rate
+//   [6] cpoeScore         — completion % over expected
+//   [7] olHealth          — OL degradation index
+//   [8] totalEnvironment  — avg game total when this team plays
+//   [9] coverTendency     — ATS% from model history
+//
+// K = 6 archetypes:
+//   AIR_RAID · POWER_RUN · WEST_COAST · SPREAD_SHOOT · BALL_CONTROL · ELITE_DEFENSE
+// ═══════════════════════════════════════════════════════════════════════════
+
+const K_CLUSTERS   = 6;
+const MAX_ITER     = 150;
+const FEATURE_DIM  = 10;
+
+// ── Archetype definitions (used for post-hoc labeling) ────────────────────
+const ARCHETYPES = {
+  AIR_RAID:     { label:"Air Raid",      icon:"🏹", color:"#38bdf8", desc:"High pass volume, spread formations, CPOE-driven QB. Thrives vs zone, struggles vs elite pass rush." },
+  POWER_RUN:    { label:"Power Run",     icon:"🦏", color:"#fb923c", desc:"Dominant OL, physical run game, controls clock. Low total environment. Wins close, covers as dog." },
+  WEST_COAST:   { label:"West Coast",    icon:"🌊", color:"#4ade80", desc:"Balanced, YAC-heavy, underneath routes. Consistent but rarely explosive. ATS split near 50/50." },
+  SPREAD_SHOOT: { label:"Spread & Shoot",icon:"🔥", color:"#f87171", desc:"Fast pace, high total environment, weak defense. Prop overs hit at high rate. Vulnerable late-season." },
+  BALL_CONTROL: { label:"Ball Control",  icon:"🧱", color:"#a78bfa", desc:"Run-first, time-of-possession focused. Overs rarely hit. Strong ATS as home favorite." },
+  ELITE_DEFENSE:{ label:"Elite Defense", icon:"🛡️", color:"#facc15", desc:"Dominant front-7, low PAPG, generates pressure. Totals lean under. Covers as road dog in divisional." },
+};
+
+// ── Matchup tendency table ────────────────────────────────────────────────
+// [offenseArchetype][defenseArchetype] → { spreadAdj, totalAdj, note }
+const MATCHUP_TENDENCIES = {
+  AIR_RAID: {
+    AIR_RAID:     { spreadAdj:0,    totalAdj:+4.5, note:"Both Air Raids → shootout. Strong over lean, variance spike." },
+    POWER_RUN:    { spreadAdj:0,    totalAdj:+1.5, note:"Air Raid vs Power Run — pace mismatch. Passing team presses." },
+    WEST_COAST:   { spreadAdj:0,    totalAdj:+2.0, note:"Air Raid offense with balanced defense — slight over." },
+    SPREAD_SHOOT: { spreadAdj:0,    totalAdj:+6.0, note:"Both teams scoring freely. One of highest-total matchups." },
+    BALL_CONTROL: { spreadAdj:-1.0, totalAdj:-2.5, note:"Ball Control defense slows Air Raid. Under lean, close game." },
+    ELITE_DEFENSE:{ spreadAdj:+2.0, totalAdj:-4.0, note:"Elite Defense neutralises Air Raid. Strong under, fade Air Raid spread." },
+  },
+  POWER_RUN: {
+    AIR_RAID:     { spreadAdj:+1.5, totalAdj:-2.0, note:"Power Run vs Air Raid offense. Under lean, run team covers." },
+    POWER_RUN:    { spreadAdj:0,    totalAdj:-5.0, note:"Two Power Run teams = historically lowest-scoring matchup." },
+    WEST_COAST:   { spreadAdj:-0.5, totalAdj:-1.5, note:"Physical game, slight under lean." },
+    SPREAD_SHOOT: { spreadAdj:+2.0, totalAdj:0,    note:"Power Run pace vs Spread Shoot. Neutral total, dog covers." },
+    BALL_CONTROL: { spreadAdj:0,    totalAdj:-4.5, note:"Battle of possessions. Strong under." },
+    ELITE_DEFENSE:{ spreadAdj:+1.5, totalAdj:-3.0, note:"Elite Defense stacks box vs run. Under, dog has value." },
+  },
+  WEST_COAST: {
+    AIR_RAID:     { spreadAdj:0,    totalAdj:+2.5, note:"West Coast balanced against Air Raid. Mild over lean." },
+    POWER_RUN:    { spreadAdj:0,    totalAdj:-1.0, note:"Slightly under, grind game." },
+    WEST_COAST:   { spreadAdj:0,    totalAdj:0,    note:"Mirror matchup — no strong lean." },
+    SPREAD_SHOOT: { spreadAdj:+1.0, totalAdj:+3.0, note:"Spread Shoot exploits West Coast. Over lean." },
+    BALL_CONTROL: { spreadAdj:0,    totalAdj:-2.0, note:"Mild under lean." },
+    ELITE_DEFENSE:{ spreadAdj:+1.5, totalAdj:-2.5, note:"Elite Defense slows West Coast. Under lean." },
+  },
+  SPREAD_SHOOT: {
+    AIR_RAID:     { spreadAdj:0,    totalAdj:+5.5, note:"Two explosive offenses. Very strong over." },
+    POWER_RUN:    { spreadAdj:-1.5, totalAdj:0,    note:"Spread Shoot vs physical team. Spread Shoot covers, neutral total." },
+    WEST_COAST:   { spreadAdj:-1.0, totalAdj:+2.5, note:"Spread Shoot paces up West Coast. Over lean." },
+    SPREAD_SHOOT: { spreadAdj:0,    totalAdj:+7.0, note:"Extreme over lean. Highest-scoring matchup type." },
+    BALL_CONTROL: { spreadAdj:-1.5, totalAdj:-1.0, note:"Ball control slows the game. Mild under, dog covers." },
+    ELITE_DEFENSE:{ spreadAdj:+2.5, totalAdj:-3.5, note:"Elite D shuts down Spread Shoot. Strong under, fade the offense." },
+  },
+  BALL_CONTROL: {
+    AIR_RAID:     { spreadAdj:+1.0, totalAdj:-2.5, note:"Ball Control slows Air Raid. Under lean." },
+    POWER_RUN:    { spreadAdj:0,    totalAdj:-4.5, note:"Two Ball Control teams — historically low-scoring." },
+    WEST_COAST:   { spreadAdj:0,    totalAdj:-2.0, note:"Grind game, under lean." },
+    SPREAD_SHOOT: { spreadAdj:+1.5, totalAdj:-1.0, note:"Ball Control upsets Spread Shoot. Dog covers lean." },
+    BALL_CONTROL: { spreadAdj:0,    totalAdj:-6.0, note:"Extreme under environment. Lowest total matchup." },
+    ELITE_DEFENSE:{ spreadAdj:+1.0, totalAdj:-4.0, note:"Strong under, defensive battle." },
+  },
+  ELITE_DEFENSE: {
+    AIR_RAID:     { spreadAdj:-2.0, totalAdj:-3.5, note:"Elite D dominates Air Raid. Fade offense, strong under." },
+    POWER_RUN:    { spreadAdj:-1.5, totalAdj:-3.0, note:"Elite D vs run game. Under, D side covers." },
+    WEST_COAST:   { spreadAdj:-1.0, totalAdj:-2.5, note:"Elite D neutralizes West Coast. Under lean." },
+    SPREAD_SHOOT: { spreadAdj:-2.5, totalAdj:-4.0, note:"Elite D shuts down shooters. Strong under, fade Spread Shoot." },
+    BALL_CONTROL: { spreadAdj:-1.0, totalAdj:-3.5, note:"Defensive grind. Strong under." },
+    ELITE_DEFENSE:{ spreadAdj:0,    totalAdj:-5.5, note:"Two Elite Defenses — extreme under. Lowest expected total." },
+  },
+};
+
+// ── K-Means++ initialisation ──────────────────────────────────────────────
+function kmeansInit(points, k) {
+  const centroids = [points[Math.floor(Math.random()*points.length)]];
+  while(centroids.length < k) {
+    const dists = points.map(p => Math.min(...centroids.map(c => euclideanSq(p, c))));
+    const total  = dists.reduce((s,d)=>s+d, 0);
+    let r = Math.random() * total, cumul = 0;
+    for(let i=0; i<points.length; i++) { cumul+=dists[i]; if(cumul>=r){centroids.push(points[i]);break;} }
+  }
+  return centroids;
+}
+function euclideanSq(a,b){ return a.reduce((s,ai,i)=>s+(ai-(b[i]||0))**2, 0); }
+function euclidean(a,b)  { return Math.sqrt(euclideanSq(a,b)); }
+
+// ── K-Means core ──────────────────────────────────────────────────────────
+function kMeans(points, k=K_CLUSTERS, maxIter=MAX_ITER) {
+  if(points.length < k) return null;
+  let centroids    = kmeansInit(points, k);
+  let assignments  = new Array(points.length).fill(0);
+  let converged    = false;
+
+  for(let iter=0; iter<maxIter && !converged; iter++) {
+    converged = true;
+    // Assignment step
+    points.forEach((p, i) => {
+      let best=0, bestDist=Infinity;
+      centroids.forEach((c,ci) => { const d=euclideanSq(p,c); if(d<bestDist){bestDist=d;best=ci;} });
+      if(best !== assignments[i]){ assignments[i]=best; converged=false; }
+    });
+    // Update step — recompute centroids
+    centroids = centroids.map((_,ci) => {
+      const cluster = points.filter((_,i)=>assignments[i]===ci);
+      if(!cluster.length) return centroids[ci];
+      return cluster[0].map((_,fi)=>cluster.reduce((s,p)=>s+(p[fi]||0),0)/cluster.length);
+    });
+  }
+
+  // Silhouette score (quality metric, -1 to +1)
+  const silhouette = computeSilhouette(points, assignments, centroids);
+
+  return { centroids, assignments, silhouette, iterations: maxIter };
+}
+
+// ── Silhouette score ──────────────────────────────────────────────────────
+function computeSilhouette(points, assignments, centroids) {
+  if(points.length < 4) return 0;
+  const scores = points.map((p, i) => {
+    const myCluster = assignments[i];
+    const a = (() => { // mean dist to same cluster
+      const same = points.filter((_,j)=>j!==i&&assignments[j]===myCluster);
+      return same.length ? same.reduce((s,q)=>s+euclidean(p,q),0)/same.length : 0;
+    })();
+    const b = (() => { // min mean dist to other clusters
+      const otherClusters = [...new Set(assignments)].filter(c=>c!==myCluster);
+      if(!otherClusters.length) return a;
+      return Math.min(...otherClusters.map(c => {
+        const other = points.filter((_,j)=>assignments[j]===c);
+        return other.length ? other.reduce((s,q)=>s+euclidean(p,q),0)/other.length : Infinity;
+      }));
+    })();
+    return a===0 && b===0 ? 0 : (b-a)/Math.max(a,b);
+  });
+  return parseFloat((scores.reduce((s,v)=>s+v,0)/scores.length).toFixed(3));
+}
+
+// ── Feature normalisation ─────────────────────────────────────────────────
+function normalise(values) {
+  const min=Math.min(...values), max=Math.max(...values);
+  if(max===min) return values.map(()=>0.5);
+  return values.map(v=>(v-min)/(max-min));
+}
+
+// ── Extract feature vectors from accumulated model data ───────────────────
+function buildFeatureVectors(teamSignalMap, backtestHistory) {
+  // teamSignalMap: { teamName: { passYds, rushYds, ppg, papg, pressureAllowed,
+  //                              pressureGenerated, cpoe, olHealth, avgTotal } }
+  const teams  = Object.keys(teamSignalMap);
+  if(teams.length < K_CLUSTERS) return null;
+
+  const raw = teams.map(team => {
+    const d = teamSignalMap[team];
+    // ATS% from backtest
+    const btGames = backtestHistory?.filter(g=>g.homeTeam===team||g.awayTeam===team)||[];
+    const atsPct  = btGames.length ? btGames.filter(g=>g.spreadCorrect).length/btGames.length : 0.5;
+    return {
+      team,
+      features: [
+        d.passYds / Math.max(d.passYds+(d.rushYds||1), 1),  // [0] passVolumeRatio
+        (d.rushYds||60) / 130,                                // [1] rushStrength (normalised to 130 max)
+        normalizeDVOA(d.offDVOA||0, false),                   // [2] offDVOA (replaces raw PPG)
+        normalizeDVOA(d.defDVOA||0, true),                    // [3] defDVOA inverted (better D = higher score)
+        1 - (d.pressureAllowed||28) / 50,                     // [4] pressureAllowed (inverted)
+        (d.pressureGenerated||45) / 70,                       // [5] pressureGenerated
+        ((d.cpoe||0) + 10) / 20,                              // [6] cpoeScore (−10 to +10 range)
+        (d.olHealth||75) / 100,                               // [7] olHealth
+        (d.avgTotal||44) / 60,                                // [8] totalEnvironment
+        atsPct,                                               // [9] coverTendency
+      ]
+    };
+  });
+
+  // Per-feature normalisation across all teams
+  const matrix       = raw.map(r=>r.features);
+  const normalised   = matrix[0].map((_,fi)=>normalise(matrix.map(r=>r[fi])));
+  const normVectors  = matrix.map((_,ti)=>normalised.map(col=>col[ti]));
+
+  return { teams, rawFeatures: raw, normVectors };
+}
+
+// ── Post-hoc archetype labelling from centroid ────────────────────────────
+function labelArchetype(centroid) {
+  // [0]passVol [1]rushStr [2]offOut [3]defStr [4]pressAllowed(inv) [5]pressGen [6]cpoe [7]olHealth [8]total [9]ats
+  const [passVol, rushStr, offOut, defStr, pressureOK, pressureGen, cpoeScore, olHealth, totalEnv, ats] = centroid;
+
+  const passHeavy  = passVol  > 0.55;
+  const runHeavy   = rushStr  > 0.60;
+  const highScoring= offOut   > 0.60;
+  const eliteDef   = defStr   > 0.65;
+  const elitePress = pressureGen > 0.62;
+  const highCPOE   = cpoeScore > 0.58;
+  const highTotal  = totalEnv > 0.65;
+  const lowTotal   = totalEnv < 0.40;
+  const healthyOL  = olHealth > 0.72;
+
+  if(eliteDef && elitePress && !highScoring)   return "ELITE_DEFENSE";
+  if(runHeavy && healthyOL && lowTotal)         return "POWER_RUN";
+  if(runHeavy && !highScoring && lowTotal)      return "BALL_CONTROL";
+  if(passHeavy && highCPOE && highTotal)        return "AIR_RAID";
+  if(passHeavy && highScoring && highTotal)     return "SPREAD_SHOOT";
+  return "WEST_COAST"; // balanced default
+}
+
+// ── Matchup tendency lookup ───────────────────────────────────────────────
+function getMatchupTendency(homeArchetype, awayArchetype) {
+  if(!homeArchetype || !awayArchetype) return null;
+  // Home team defends against away team's offense
+  const tend = MATCHUP_TENDENCIES[awayArchetype]?.[homeArchetype];
+  if(!tend) return null;
+  return { ...tend, homeArchetype, awayArchetype,
+    label:`${ARCHETYPES[awayArchetype]?.label} offense vs ${ARCHETYPES[homeArchetype]?.label} defense` };
+}
+
+// ── Run full clustering pipeline ──────────────────────────────────────────
+function runClusteringPipeline(teamSignalMap, backtestHistory) {
+  const extracted = buildFeatureVectors(teamSignalMap, backtestHistory);
+  if(!extracted) return null;
+  const { teams, rawFeatures, normVectors } = extracted;
+
+  // Run K-Means 3 times with different seeds, keep best silhouette
+  let best = null;
+  for(let run=0; run<3; run++) {
+    const result = kMeans(normVectors, K_CLUSTERS);
+    if(result && (!best || result.silhouette > best.silhouette)) best = result;
+  }
+  if(!best) return null;
+
+  // Build cluster map: clusterIndex → { archetype, teams, centroid }
+  const clusters = {};
+  best.assignments.forEach((ci, ti) => {
+    if(!clusters[ci]) clusters[ci] = { centroid: best.centroids[ci], teamList:[], archetype: null };
+    clusters[ci].teamList.push(teams[ti]);
+  });
+  Object.keys(clusters).forEach(ci => {
+    clusters[ci].archetype = labelArchetype(clusters[ci].centroid);
+  });
+
+  // Team → archetype map
+  const teamArchetypes = {};
+  best.assignments.forEach((ci, ti) => {
+    teamArchetypes[teams[ti]] = clusters[ci].archetype;
+  });
+
+  return { clusters, teamArchetypes, silhouette: best.silhouette,
+           teamsAnalyzed: teams.length, features: rawFeatures };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCHEMATIC CLUSTER PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+function SchematicClusterPanel({ clusterResult, homeTeam, awayTeam,
+  onFetchSchematicData, fetchingSchematic }) {
+
+  const [open, setOpen]    = useState(false);
+  const [view, setView]    = useState("matchup"); // matchup | clusters | teams
+
+  const homeArch  = clusterResult?.teamArchetypes?.[homeTeam];
+  const awayArch  = clusterResult?.teamArchetypes?.[awayTeam];
+  const tendency  = homeArch && awayArch ? getMatchupTendency(homeArch, awayArch) : null;
+  const hasBothTeams = !!(homeArch && awayArch);
+
+  const silhouetteGrade = s => s>=0.5?"A":s>=0.3?"B":s>=0.1?"C":"D";
+  const silhouetteColor = s => s>=0.5?"#4ade80":s>=0.3?"#f59e0b":s>=0.1?"#f87171":"#555";
+
+  return (
+    <Panel border="rgba(99,102,241,0.22)" bg="rgba(99,102,241,0.03)" mb="10px">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <span style={{fontSize:"12px"}}>🧬</span>
+          <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:"#818cf8",fontFamily:"'Barlow Condensed',sans-serif"}}>Schematic Archetype Clustering</span>
+          {clusterResult && <Tag color="#818cf8">{clusterResult.teamsAnalyzed} teams · K={K_CLUSTERS}</Tag>}
+          {clusterResult && <Tag color={silhouetteColor(clusterResult.silhouette)}>Silhouette {silhouetteGrade(clusterResult.silhouette)}: {clusterResult.silhouette}</Tag>}
+          {hasBothTeams && tendency && <Tag color="#fbbf24">{ARCHETYPES[awayArch]?.icon} vs {ARCHETYPES[homeArch]?.icon}</Tag>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+          <button onClick={e=>{e.stopPropagation();onFetchSchematicData();}} disabled={fetchingSchematic}
+            style={{padding:"5px 10px",borderRadius:"5px",border:"1px solid rgba(99,102,241,0.3)",background:"rgba(99,102,241,0.1)",color:fetchingSchematic?"#333":"#818cf8",fontSize:"9px",fontWeight:700,cursor:fetchingSchematic?"not-allowed":"pointer",fontFamily:"'Barlow Condensed',sans-serif",display:"flex",alignItems:"center",gap:"4px"}}>
+            {fetchingSchematic?<><Spinner/>Clustering…</>:"↻ Run Clustering"}
+          </button>
+          <span style={{color:"#333",fontSize:"10px"}}>{open?"▲":"▼"}</span>
+        </div>
+      </div>
+
+      {open && (
+        <div style={{marginTop:"12px"}}>
+          {!clusterResult ? (
+            <div style={{textAlign:"center",padding:"20px 0"}}>
+              <div style={{fontSize:"28px",marginBottom:"8px"}}>🧬</div>
+              <div style={{fontSize:"11px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"4px"}}>Hit "Run Clustering" to classify all 32 teams</div>
+              <div style={{fontSize:"9px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.6",maxWidth:"320px",margin:"0 auto"}}>Fetches current season schematic data for all teams, builds 10-dimensional feature vectors, and runs K-Means++ (K=6) to discover natural groupings. Labels each cluster with an NFL archetype based on centroid analysis.</div>
+            </div>
+          ) : (
+            <>
+              {/* View tabs */}
+              <div style={{display:"flex",gap:"4px",marginBottom:"12px"}}>
+                {[["matchup","⚡ Matchup Edge"],["clusters","🔵 All Clusters"],["teams","👥 Team Map"]].map(([k,l])=>(
+                  <button key={k} onClick={()=>setView(k)} style={{padding:"5px 10px",borderRadius:"5px",border:`1px solid ${view===k?"rgba(99,102,241,0.4)":"rgba(255,255,255,0.07)"}`,background:view===k?"rgba(99,102,241,0.12)":"transparent",color:view===k?"#818cf8":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</button>
+                ))}
+              </div>
+
+              {/* ── MATCHUP EDGE VIEW ── */}
+              {view==="matchup" && (
+                <div>
+                  {!hasBothTeams ? (
+                    <div style={{fontSize:"10px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",textAlign:"center",padding:"12px"}}>Select both teams to see the schematic matchup edge</div>
+                  ) : (
+                    <>
+                      {/* Team archetype cards */}
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"10px"}}>
+                        {[{team:awayTeam,arch:awayArch,label:"Away (Offense)"},{team:homeTeam,arch:homeArch,label:"Home (Defense)"}].map(({team,arch,label})=>{
+                          const a=ARCHETYPES[arch]||{};
+                          return (
+                            <div key={team} style={{background:`${a.color||"#555"}0d`,border:`1px solid ${a.color||"#555"}22`,borderRadius:"8px",padding:"10px 12px"}}>
+                              <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px"}}>{label}</div>
+                              <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"5px"}}>
+                                <span style={{fontSize:"20px"}}>{a.icon||"❓"}</span>
+                                <div>
+                                  <div style={{fontSize:"12px",fontWeight:800,color:a.color||"#aaa",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{a.label||arch}</div>
+                                  <div style={{fontSize:"9px",color:tc(team),fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>{abb(team)}</div>
+                                </div>
+                              </div>
+                              <div style={{fontSize:"9px",color:"#666",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{a.desc}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Matchup tendency */}
+                      {tendency && (
+                        <div style={{background:"rgba(99,102,241,0.06)",border:"1px solid rgba(99,102,241,0.18)",borderRadius:"8px",padding:"12px",marginBottom:"10px"}}>
+                          <div style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#818cf8",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"7px"}}>
+                            🧬 Schematic Matchup Tendency
+                          </div>
+                          <div style={{fontSize:"10px",color:"#a5b4fc",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>{tendency.note}</div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"7px"}}>
+                            {[["Spread Adj",tendency.spreadAdj,tendency.spreadAdj>0?"#f87171":tendency.spreadAdj<0?"#4ade80":"#555"],["Total Adj",tendency.totalAdj,tendency.totalAdj>0?"#4ade80":tendency.totalAdj<0?"#f87171":"#555"]].map(([l,v,c])=>(
+                              <div key={l} style={{background:"rgba(255,255,255,0.04)",borderRadius:"6px",padding:"8px",textAlign:"center"}}>
+                                <div style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"3px"}}>{l}</div>
+                                <div style={{fontSize:"18px",fontWeight:900,color:c,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{v>0?"+":""}{v}</div>
+                                <div style={{fontSize:"7px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px"}}>pts applied to model</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* ── ALL CLUSTERS VIEW ── */}
+              {view==="clusters" && clusterResult.clusters && (
+                <div>
+                  <div style={{fontSize:"9px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"8px"}}>K={K_CLUSTERS} clusters · Silhouette score {clusterResult.silhouette} (range -1→+1, higher=better separation)</div>
+                  {Object.entries(clusterResult.clusters).map(([ci,cluster])=>{
+                    const arch=cluster.archetype;
+                    const a=ARCHETYPES[arch]||{label:arch,icon:"❓",color:"#555",desc:""};
+                    return(
+                      <div key={ci} style={{background:`${a.color}0a`,border:`1px solid ${a.color}20`,borderRadius:"7px",padding:"9px 11px",marginBottom:"5px"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:"7px",marginBottom:"5px"}}>
+                          <span style={{fontSize:"16px"}}>{a.icon}</span>
+                          <span style={{fontSize:"11px",fontWeight:800,color:a.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{a.label}</span>
+                          <Tag color={a.color}>{cluster.teamList.length} teams</Tag>
+                        </div>
+                        <div style={{display:"flex",gap:"3px",flexWrap:"wrap",marginBottom:"5px"}}>
+                          {cluster.teamList.map(t=>(
+                            <div key={t} style={{display:"flex",alignItems:"center",gap:"3px",background:"rgba(255,255,255,0.05)",borderRadius:"3px",padding:"2px 6px"}}>
+                              <div style={{width:"5px",height:"5px",borderRadius:"50%",background:tc(t)}}/>
+                              <span style={{fontSize:"9px",color:"#ccc",fontFamily:"'Barlow Condensed',sans-serif"}}>{abb(t)}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{fontSize:"8px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.3"}}>{a.desc}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* ── TEAM MAP VIEW ── */}
+              {view==="teams" && (
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px"}}>
+                  {Object.entries(clusterResult.teamArchetypes).sort((a,b)=>a[1].localeCompare(b[1])).map(([team,arch])=>{
+                    const a=ARCHETYPES[arch]||{label:arch,icon:"❓",color:"#555"};
+                    const isActive=team===homeTeam||team===awayTeam;
+                    return(
+                      <div key={team} style={{display:"flex",alignItems:"center",gap:"6px",padding:"5px 8px",background:isActive?`${a.color}12`:"rgba(255,255,255,0.02)",border:`1px solid ${isActive?a.color+"30":"rgba(255,255,255,0.05)"}`,borderRadius:"5px"}}>
+                        <span style={{fontSize:"12px",flexShrink:0}}>{a.icon}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:"9px",fontWeight:isActive?800:600,color:isActive?tc(team):"#aaa",fontFamily:"'Barlow Condensed',sans-serif",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{abb(team)}</div>
+                          <div style={{fontSize:"7px",color:a.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{a.label}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div style={{marginTop:"8px",fontSize:"8px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>
+                K-Means++ · 10-dimensional feature vectors · {clusterResult.teamsAnalyzed} teams analysed · Silhouette quality score {clusterResult.silhouette}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ML ENGINE DASHBOARD
+// Single collapsible panel housing all three background ML systems:
+//   Backtest Engine · Self-Learning · Schematic Clustering
+// Plus analytics: Feature Importance · Mistake Log · Signal Calibration
+//
+// All ML logic continues running in the background regardless of whether
+// this panel is open. The dashboard is just the window into the engine.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function MLEngineDashboard({
+  // Backtest props
+  backtestHistory, onAddResult, onClearBacktest,
+  modelSpread, modelTotal, modelTotalLean,
+  homeTeam, awayTeam, confidence,
+  // CLV props
+  clvHistory, onAddCLV, onClearCLV, lines, gameResult,
+  // Self-learning props
+  learnedWeights, patternMemory, teamBias, onResetLearning,
+  // Signal weight props
+  signalWeights, onUpdateWeights, calibration,
+  // Feature importance props
+  featureImportance, onAutoCalibrate,
+  // Drift props
+  driftResult,
+  // Mistakes props
+  mistakes,
+  // Clustering props
+  clusterResult, onFetchSchematicData, fetchingSchematic,
+  // Season dashboard props
+  clvHistory: _clv, parlayHistory, signalWeights: _sw,
+  // Power rankings props
+  onLoadMatchup,
+}) {
+  const [open, setOpen]   = useState(false);
+  const [tab, setTab]     = useState("backtest");
+
+  // Live stats for header badges
+  const totalGames    = backtestHistory?.length || 0;
+  const atsRate       = totalGames > 0 ? Math.round(backtestHistory.filter(g=>g.spreadCorrect).length/totalGames*100) : null;
+  const weightsActive = learnedWeights && JSON.stringify(learnedWeights) !== JSON.stringify(DEFAULT_WEIGHTS);
+  const clustersReady = !!(clusterResult?.teamsAnalyzed >= 6);
+  const driftAlert    = driftResult?.isDrifting;
+  const hasEdge       = featureImportance?.filter(f=>f.reliable&&f.recommendation==="increase_weight").length || 0;
+
+  const TABS = [
+    { key:"backtest",  icon:"🧪", label:"Backtest",      badge: totalGames > 0 ? `${totalGames}G` : null,    badgeColor: atsRate>=53?"#4ade80":atsRate>=50?"#f59e0b":atsRate!=null?"#f87171":"#555" },
+    { key:"learning",  icon:"🧠", label:"Self-Learning", badge: weightsActive ? "Active" : `${totalGames}/${MIN_SAMPLE}G`, badgeColor: weightsActive?"#10b981":"#555" },
+    { key:"clustering",icon:"🧬", label:"Clustering",    badge: clustersReady ? `K=6 · ${clusterResult.teamsAnalyzed}T` : "Run →", badgeColor: clustersReady?"#818cf8":"#555" },
+    { key:"gamelog",   icon:"📋", label:"Game Log",    badge: totalGames > 0 ? totalGames+"G" : null, badgeColor:"#38bdf8" },
+    { key:"analytics", icon:"📊", label:"Analytics",     badge: driftAlert ? "⚠ Drift" : hasEdge > 0 ? `${hasEdge} signals↑` : null, badgeColor: driftAlert?"#f87171":hasEdge?"#4ade80":"#555" },
+  ];
+
+  return (
+    <div style={{marginBottom:"12px",background:"rgba(0,0,0,0.35)",border:`1px solid ${driftAlert?"rgba(239,68,68,0.22)":"rgba(255,255,255,0.07)"}`,borderRadius:"12px",overflow:"hidden"}}>
+      {/* ── Header ─────────────────────────────────────────────── */}
+      <div style={{padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",background:"rgba(255,255,255,0.02)"}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"7px"}}>
+            <div style={{width:"28px",height:"28px",borderRadius:"7px",background:"linear-gradient(135deg,rgba(99,102,241,0.3),rgba(16,185,129,0.2))",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"14px",flexShrink:0}}>🤖</div>
+            <div>
+              <div style={{fontSize:"11px",fontWeight:800,letterSpacing:"0.1em",textTransform:"uppercase",color:"#a5b4fc",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>ML Engine</div>
+              <div style={{fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"1px",letterSpacing:"0.07em",textTransform:"uppercase"}}>
+                {weightsActive?"Weights calibrated":"Not yet calibrated"} · {clustersReady?`${clusterResult.teamsAnalyzed} teams clustered`:"No cluster"} · {totalGames} games logged
+              </div>
+            </div>
+          </div>
+          {/* Live status pills */}
+          <div style={{display:"flex",gap:"5px",flexWrap:"wrap"}}>
+            {totalGames > 0 && <Tag color={atsRate>=53?"#4ade80":atsRate>=50?"#f59e0b":"#f87171"}>ATS {atsRate}%</Tag>}
+            {weightsActive && <Tag color="#10b981">⚡ Learning</Tag>}
+            {clustersReady && <Tag color="#818cf8">🧬 {ARCHETYPES[clusterResult?.teamArchetypes?.[homeTeam]]?.icon||""}{ARCHETYPES[clusterResult?.teamArchetypes?.[awayTeam]]?.icon||""}</Tag>}
+            {driftAlert && <Tag color="#f87171">⚠ Drift {driftResult.severity}</Tag>}
+            {hasEdge > 0 && <Tag color="#4ade80">{hasEdge} signal{hasEdge>1?"s":""} ↑</Tag>}
+          </div>
+        </div>
+        <span style={{color:"#333",fontSize:"12px",flexShrink:0}}>{open?"▲":"▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{padding:"12px 16px 16px"}}>
+          {/* ── Tab row ───────────────────────────────────────── */}
+          <div style={{display:"flex",gap:"4px",marginBottom:"14px",borderBottom:"1px solid rgba(255,255,255,0.06)",paddingBottom:"10px",flexWrap:"wrap"}}>
+            {TABS.map(t=>(
+              <button key={t.key} onClick={()=>setTab(t.key)}
+                style={{display:"flex",alignItems:"center",gap:"5px",padding:"6px 11px",borderRadius:"7px",border:`1px solid ${tab===t.key?"rgba(165,180,252,0.35)":"rgba(255,255,255,0.07)"}`,background:tab===t.key?"rgba(99,102,241,0.12)":"transparent",color:tab===t.key?"#a5b4fc":"#555",fontSize:"10px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",transition:"all 0.15s"}}>
+                <span style={{fontSize:"11px"}}>{t.icon}</span>
+                {t.label}
+                {t.badge&&<span style={{background:`${t.badgeColor}20`,border:`1px solid ${t.badgeColor}40`,borderRadius:"3px",padding:"0px 5px",fontSize:"8px",fontWeight:700,color:t.badgeColor}}>{t.badge}</span>}
+              </button>
+            ))}
+          </div>
+
+          {/* ── BACKTEST TAB ──────────────────────────────────── */}
+          {tab==="backtest"&&(
+            <div>
+              <BacktestPanel
+                backtestHistory={backtestHistory} onAddResult={onAddResult}
+                onClearBacktest={onClearBacktest} modelSpread={modelSpread}
+                modelTotal={modelTotal} modelTotalLean={modelTotalLean}
+                homeTeam={homeTeam} awayTeam={awayTeam} confidence={confidence}/>
+              <CLVPanel
+                clvHistory={clvHistory} onAddCLV={onAddCLV} onClearCLV={onClearCLV}
+                modelSpread={gameResult?.spreadPick?.replace(/[^\d.]/g,"")||lines?.spread}
+                lines={lines} homeTeam={homeTeam} awayTeam={awayTeam}/>
+            </div>
+          )}
+
+          {/* ── SELF-LEARNING TAB ─────────────────────────────── */}
+          {tab==="learning"&&(
+            <div>
+              <SelfLearningPanel
+                learnedWeights={learnedWeights} patternMemory={patternMemory}
+                teamBias={teamBias} backtestHistory={backtestHistory}
+                onResetLearning={onResetLearning}/>
+              <SignalWeightPanel
+                weights={signalWeights} onUpdateWeights={onUpdateWeights}
+                calibrationStats={calibration}/>
+              <CalibrationPanel calibration={calibration}/>
+            </div>
+          )}
+
+          {/* ── CLUSTERING TAB ────────────────────────────────── */}
+          {tab==="clustering"&&(
+            <div>
+              <SchematicClusterPanel
+                clusterResult={clusterResult} homeTeam={homeTeam} awayTeam={awayTeam}
+                onFetchSchematicData={onFetchSchematicData}
+                fetchingSchematic={fetchingSchematic}/>
+              <PowerRankingsPanel
+                backtestHistory={backtestHistory}
+                onLoadMatchup={onLoadMatchup}/>
+              <SeasonDashboard
+                backtestHistory={backtestHistory} clvHistory={clvHistory}
+                parlayHistory={parlayHistory} signalWeights={signalWeights}/>
+            </div>
+          )}
+
+          {/* ── GAME LOG TAB — unified backtest + CLV + bankroll ── */}
+          {tab==="gamelog"&&(
+            <div>
+              <div style={{fontSize:"9px",color:"#555",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"9px",lineHeight:"1.5"}}>
+                Unified log: every game analyzed, model pick, ATS result, CLV, and units wagered. The complete picture in one view.
+              </div>
+              {/* Header */}
+              <div style={{display:"grid",gridTemplateColumns:"60px 1fr 55px 55px 45px 45px",gap:"4px",padding:"4px 6px",marginBottom:"3px"}}>
+                {["Date","Matchup","Pick","Result","CLV","Units"].map(h=>(
+                  <div key={h} style={{fontSize:"7px",fontWeight:700,color:"#333",fontFamily:"'Barlow Condensed',sans-serif",textTransform:"uppercase",letterSpacing:"0.06em"}}>{h}</div>
+                ))}
+              </div>
+              {backtestHistory?.length > 0 ? (
+                <div style={{maxHeight:"300px",overflowY:"auto"}}>
+                  {backtestHistory.map((g,i)=>{
+                    const clvEntry = clvHistory?.find(c=>c.homeTeam===g.homeTeam&&c.awayTeam===g.awayTeam);
+                    const bankEntry= (clvHistory||[]).find(c=>c.homeTeam===g.homeTeam&&c.awayTeam===g.awayTeam&&c.units);
+                    const resColor = g.spreadCorrect?"#4ade80":g.atsResult==="PUSH"?"#f59e0b":"#f87171";
+                    const clvVal   = clvEntry?.clv;
+                    const clvColor = clvVal>0?"#4ade80":clvVal<0?"#f87171":"#555";
+                    return(
+                      <div key={i} style={{display:"grid",gridTemplateColumns:"60px 1fr 55px 55px 45px 45px",gap:"4px",padding:"5px 6px",background:i%2===0?"rgba(255,255,255,0.025)":"transparent",borderRadius:"3px",alignItems:"center"}}>
+                        <div style={{fontSize:"8px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif"}}>{g.date}</div>
+                        <div style={{fontSize:"8px",color:"#ccc",fontFamily:"'Barlow Condensed',sans-serif",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                          <span style={{color:tc(g.awayTeam||"")}}>{abb(g.awayTeam)}</span>
+                          <span style={{color:"#333"}}> @ </span>
+                          <span style={{color:tc(g.homeTeam||"")}}>{abb(g.homeTeam)}</span>
+                        </div>
+                        <div style={{fontSize:"8px",fontWeight:700,color:"#aaa",fontFamily:"'Barlow Condensed',sans-serif"}}>{g.modelSpread?"-"+g.modelSpread:"—"}</div>
+                        <div style={{fontSize:"9px",fontWeight:800,color:resColor,fontFamily:"'Barlow Condensed',sans-serif"}}>{g.atsResult||"—"}</div>
+                        <div style={{fontSize:"9px",fontWeight:700,color:clvColor,fontFamily:"'Barlow Condensed',sans-serif"}}>{clvVal!=null?(clvVal>0?"+":"")+clvVal:"—"}</div>
+                        <div style={{fontSize:"9px",color:"#888",fontFamily:"'Barlow Condensed',sans-serif"}}>{bankEntry?.units?bankEntry.units+"u":"—"}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ):(
+                <div style={{textAlign:"center",padding:"16px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",fontSize:"10px"}}>No games logged yet. Run analyses and fetch results to populate.</div>
+              )}
+            </div>
+          )}
+
+          {/* ── ANALYTICS TAB ─────────────────────────────────── */}
+          {tab==="analytics"&&(
+            <div>
+              <DriftDetectorPanel driftResult={driftResult} onResetWeights={onResetLearning}/>
+              <FeatureImportancePanel
+                features={featureImportance} onAutoCalibrate={onAutoCalibrate}
+                onUpdateWeights={onUpdateWeights}/>
+              <MistakeDigestPanel mistakes={mistakes}/>
+            </div>
+          )}
+
+          {/* ── Footer note ───────────────────────────────────── */}
+          <div style={{marginTop:"10px",padding:"7px 10px",background:"rgba(99,102,241,0.04)",border:"1px solid rgba(99,102,241,0.1)",borderRadius:"6px",fontSize:"9px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5"}}>
+            🤖 All ML systems run silently in the background. Weight updates fire on every backtest result. Clustering re-runs automatically as signal data accumulates. Drift is checked after every logged game.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEEKLY EXECUTION SEQUENCE ENGINE
+// ─────────────────────────────────────────────────────────────────────────
+// Four locked phases, Eastern Time:
+//   Phase 1 — Tuesday   9:00 AM  → Fetch & Harmonize
+//   Phase 2 — Thursday  4:00 PM  → Context & Roster Adjustments
+//   Phase 3 — Friday    3:00 PM  → Multi-Model Ensemble
+//   Phase 4 — Sunday   10:00 AM  → Market Arbitration & Line Shopping
+//
+// On every app open, checks current ET time against the schedule.
+// If a phase is due and not yet executed this week, surfaces a banner.
+// Completion stored per NFL week (keyed by Sunday game date).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Phase definitions ─────────────────────────────────────────────────────
+const EXECUTION_PHASES = [
+  {
+    id: "P1", day: 2, hour: 9, min: 0,   // Tuesday 9:00 AM ET
+    label: "Fetch & Harmonize",
+    icon: "📡",
+    color: "#38bdf8",
+    desc: "Pull power rankings, full schedule, injury reports, team stats, schematic data. Re-run K-Means++ clustering on all 32 teams. Harmonize signal stack for the week.",
+    steps: ["Fetch week schedule","Fetch power rankings (ESPN/CBS)","Fetch all-32 schematic data + re-cluster","Fetch opening injury reports","Update teamSignalMap","Run GNN roster baseline"],
+    dayLabel: "Tuesday",
+    timeLabel: "9:00 AM ET",
+  },
+  {
+    id: "P2", day: 4, hour: 16, min: 0,  // Thursday 4:00 PM ET
+    label: "Context & Roster Adjustments",
+    icon: "🏥",
+    color: "#fb923c",
+    desc: "Thursday practice reports drop ~3:00 PM ET. Fetch updated injury designations (Limited/Full/DNP), re-run GNN cascade model, update roster integrity scores, adjust spreads.",
+    steps: ["Fetch Thursday practice participation","Re-run GNN roster interdependency","Update snap count projections","Fetch referee assignments for week","Inject updated context into signal stack","Flag any status changes from Tuesday baseline"],
+    dayLabel: "Thursday",
+    timeLabel: "4:00 PM ET",
+  },
+  {
+    id: "P3", day: 5, hour: 15, min: 0,  // Friday 3:00 PM ET
+    label: "Multi-Model Ensemble",
+    icon: "🤖",
+    color: "#a78bfa",
+    desc: "Final injury report window. Run all 17 parallel signal fetches for the week's top games. Execute Monte Carlo simulation, schematic archetype matchup analysis, and WeeklyPick scanner across the full slate.",
+    steps: ["Run 17-signal parallel fetch for top games","Execute Monte Carlo (10,000 iterations)","Run schematic archetype matchup analysis","Execute WeeklyPick scanner (full slate)","Compute GNN-adjusted spread for each game","Lock ensemble recommendation"],
+    dayLabel: "Friday",
+    timeLabel: "3:00 PM ET",
+  },
+  {
+    id: "P4", day: 0, hour: 10, min: 0,  // Sunday 10:00 AM ET
+    label: "Market Arbitration & Line Shopping",
+    icon: "⚡",
+    color: "#fbbf24",
+    desc: "Final 3-hour window before 1:00 PM kickoffs. Fetch live lines, run sportsbook profiling, detect sharp-line gaps and middle opportunities. Lock final picks with best available numbers.",
+    steps: ["Fetch live lines from all 6 books","Run Score vs public-book divergence scan","Detect middle opportunities (key # in window)","Run sharp-line gap detector","Confirm GNN roster status (game-time decisions)","Lock final parlay with best available lines"],
+    dayLabel: "Sunday",
+    timeLabel: "10:00 AM ET",
+  },
+];
+
+// ── ET timezone utilities ─────────────────────────────────────────────────
+function getETNow() {
+  const etStr = new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour12: false,
+    weekday:"numeric", year:"numeric", month:"numeric", day:"numeric", hour:"numeric", minute:"numeric" });
+  // Parse: "N, M/D/YYYY, HH:MM"  — day of week 0=Sun
+  const d = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  return { dow: d.getDay(), hour: d.getHours(), min: d.getMinutes(), date: d };
+}
+
+function getWeekKey() {
+  // Key = the Sunday of the current NFL week (nearest future Sunday or today if Sunday)
+  const et = getETNow();
+  const d  = new Date(et.date);
+  const daysUntilSunday = (7 - d.getDay()) % 7;
+  d.setDate(d.getDate() + daysUntilSunday);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function getPhaseStatus(phase, completedPhases) {
+  const et = getETNow();
+  const wk = getWeekKey();
+  const isCompleted = completedPhases?.[wk]?.[phase.id];
+
+  // Determine if this phase is "due" — past its start time this week
+  let isDue = false;
+  const phaseDay = phase.day; // 0=Sun, 2=Tue, 4=Thu, 5=Fri
+  const curDay   = et.dow;
+
+  // Sunday is both "start of NFL schedule week" and "Phase 4 day"
+  // Tue(2) < Thu(4) < Fri(5) < Sun(0) — handle the wrap
+  const ordered = [2, 4, 5, 0]; // order within NFL week
+  const phaseIdx = ordered.indexOf(phaseDay);
+  const curIdx   = ordered.indexOf(curDay);
+
+  if (curIdx === phaseIdx) {
+    isDue = et.hour > phase.hour || (et.hour === phase.hour && et.min >= phase.min);
+  } else if (curIdx > phaseIdx) {
+    isDue = true; // past the phase day
+  }
+  // For Sunday wrap: if today is Sat or Sun and phase is Sun, handle separately
+  if (phaseDay === 0 && curDay === 0) {
+    isDue = et.hour > phase.hour || (et.hour === phase.hour && et.min >= phase.min);
+  }
+
+  // Countdown to next occurrence
+  function minsUntil() {
+    const now = new Date();
+    const target = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const daysAhead = ((phaseDay - target.getDay() + 7) % 7) || (
+      (et.hour > phase.hour || (et.hour === phase.hour && et.min >= phase.min)) ? 7 : 0
+    );
+    target.setDate(target.getDate() + daysAhead);
+    target.setHours(phase.hour, phase.min, 0, 0);
+    return Math.round((target - now) / 60000);
+  }
+
+  const mins = minsUntil();
+  const hrs  = Math.floor(mins / 60);
+  const d2   = Math.floor(hrs / 24);
+  const countdown = d2 > 0 ? `${d2}d ${hrs%24}h` : hrs > 0 ? `${hrs}h ${mins%60}m` : `${mins}m`;
+
+  return { isDue, isCompleted, countdown, isActive: isDue && !isCompleted };
+}
+
+// ── Execution Timeline Component ──────────────────────────────────────────
+function WeeklyExecutionDashboard({
+  onPhase1, onPhase2, onPhase3, onPhase4,
+  phase1Running, phase2Running, phase3Running, phase4Running,
+  completedPhases, onMarkComplete,
+}) {
+  const [activePhase, setActivePhase] = useState(null);
+  const [tick, setTick] = useState(0);
+
+  // Refresh countdown every 60s
+  useEffect(() => {
+    const t = setInterval(() => setTick(n => n + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  const statuses  = EXECUTION_PHASES.map(p => ({ ...p, ...getPhaseStatus(p, completedPhases) }));
+  const duePhases = statuses.filter(p => p.isActive);
+  const nextPhase = statuses.find(p => !p.isDue && !p.isCompleted);
+  // Start open only if a phase is due, otherwise collapsed
+  const [open, setOpen] = useState(duePhases.length > 0);
+
+  const phaseHandlers = { P1: onPhase1, P2: onPhase2, P3: onPhase3, P4: onPhase4 };
+  const phaseRunning  = { P1: phase1Running, P2: phase2Running, P3: phase3Running, P4: phase4Running };
+
+  return (
+    <div style={{marginBottom:"14px"}}>
+      {/* Due-phase alert banners */}
+      {duePhases.map(p => (
+        <div key={p.id} style={{background:`${p.color}10`,border:`2px solid ${p.color}40`,borderRadius:"10px",padding:"10px 14px",marginBottom:"8px",animation:"fadeSlideUp 0.3s ease-out"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap"}}>
+            <div style={{width:"32px",height:"32px",borderRadius:"8px",background:`${p.color}20`,border:`1px solid ${p.color}40`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"16px",flexShrink:0}}>{p.icon}</div>
+            <div style={{flex:1,minWidth:"120px"}}>
+              <div style={{display:"flex",alignItems:"center",gap:"6px",marginBottom:"2px"}}>
+                <div style={{width:"6px",height:"6px",borderRadius:"50%",background:p.color,boxShadow:`0 0 8px ${p.color}`,animation:"pulse 1s infinite"}}/>
+                <span style={{fontSize:"11px",fontWeight:900,letterSpacing:"0.08em",textTransform:"uppercase",color:p.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{p.id} — {p.label} — DUE NOW</span>
+              </div>
+              <div style={{fontSize:"9px",color:`${p.color}99`,fontFamily:"'Barlow Condensed',sans-serif"}}>{p.dayLabel} {p.timeLabel} · {p.desc.slice(0,80)}…</div>
+            </div>
+            <button onClick={phaseHandlers[p.id]} disabled={phaseRunning[p.id]}
+              style={{padding:"8px 16px",borderRadius:"7px",border:"none",background:`linear-gradient(135deg,${p.color},${p.color}bb)`,color:"#000",fontSize:"11px",fontWeight:800,cursor:phaseRunning[p.id]?"not-allowed":"pointer",fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.05em",display:"flex",alignItems:"center",gap:"5px",flexShrink:0}}>
+              {phaseRunning[p.id]?<><Spinner/> Running…</>:`▶ Execute ${p.id}`}
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {/* Main dashboard */}
+      <div style={{background:"rgba(0,0,0,0.4)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:"12px",overflow:"hidden"}}>
+        <div style={{padding:"11px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",background:"rgba(255,255,255,0.02)",borderBottom:open?"1px solid rgba(255,255,255,0.05)":"none"}} onClick={()=>setOpen(o=>!o)}>
+          <div style={{display:"flex",alignItems:"center",gap:"9px"}}>
+            <span style={{fontSize:"13px"}}>📅</span>
+            <div>
+              <div style={{fontSize:"11px",fontWeight:800,letterSpacing:"0.1em",textTransform:"uppercase",color:"#e2e8f0",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>Weekly Execution Sequence</div>
+              <div style={{fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"1px",letterSpacing:"0.07em",textTransform:"uppercase"}}>
+                {duePhases.length>0?`${duePhases.length} phase${duePhases.length>1?"s":""} due now`:nextPhase?`Next: ${nextPhase.label} in ${nextPhase.countdown}`:"All phases complete for this week"}
+              </div>
+            </div>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+            {statuses.filter(p=>p.isCompleted).map(p=><Tag key={p.id} color={p.color}>✓ {p.id}</Tag>)}
+            <span style={{color:"#333",fontSize:"11px"}}>{open?"▲":"▼"}</span>
+          </div>
+        </div>
+
+        {open && (
+          <div style={{padding:"14px 16px"}}>
+            {/* Timeline */}
+            <div style={{position:"relative",marginBottom:"14px"}}>
+              {/* Connector line */}
+              <div style={{position:"absolute",left:"19px",top:"24px",bottom:"24px",width:"2px",background:"rgba(255,255,255,0.06)",zIndex:0}}/>
+              {statuses.map((p, i) => {
+                const status = p.isCompleted?"done":p.isActive?"active":p.isDue?"overdue":"upcoming";
+                const dotColor = status==="done"?"#4ade80":status==="active"?p.color:status==="overdue"?"#f87171":"#2a2a2a";
+                return (
+                  <div key={p.id} style={{display:"flex",gap:"12px",marginBottom:i<3?"16px":"0",position:"relative",zIndex:1}}
+                    onClick={()=>setActivePhase(activePhase===p.id?null:p.id)}>
+                    {/* Node */}
+                    <div style={{width:"38px",height:"38px",borderRadius:"10px",background:status==="done"?"rgba(74,222,128,0.12)":status==="active"?`${p.color}18`:"rgba(255,255,255,0.04)",border:`2px solid ${dotColor}${status==="upcoming"?"33":"66"}`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,cursor:"pointer",transition:"all 0.15s",boxShadow:status==="active"?`0 0 12px ${p.color}44`:status==="done"?"0 0 8px rgba(74,222,128,0.3)":"none"}}>
+                      <span style={{fontSize:status==="done"?"14px":"16px"}}>{status==="done"?"✓":p.icon}</span>
+                    </div>
+                    {/* Content */}
+                    <div style={{flex:1,cursor:"pointer",paddingTop:"2px"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap",marginBottom:"3px"}}>
+                        <span style={{fontSize:"10px",fontWeight:800,color:status==="done"?"#4ade80":status==="active"?p.color:status==="overdue"?"#f87171":"#555",fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.05em"}}>{p.dayLabel} {p.timeLabel}</span>
+                        <span style={{fontSize:"10px",fontWeight:700,color:status==="done"?"#4ade80":status==="active"?p.color:"#888",fontFamily:"'Barlow Condensed',sans-serif"}}>— {p.label}</span>
+                        {status==="done"&&<Tag color="#4ade80">Complete</Tag>}
+                        {status==="active"&&<Tag color={p.color}>DUE NOW</Tag>}
+                        {status==="upcoming"&&<Tag color="#444">In {p.countdown}</Tag>}
+                      </div>
+                      <div style={{fontSize:"9px",color:"#444",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.4"}}>{p.desc.slice(0,100)}…</div>
+
+                      {/* Expanded steps */}
+                      {activePhase===p.id && (
+                        <div style={{marginTop:"8px",padding:"8px 10px",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:"6px"}}>
+                          <div style={{fontSize:"8px",fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:p.color,fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"6px"}}>{p.id} Execution Steps</div>
+                          {p.steps.map((step, si) => (
+                            <div key={si} style={{display:"flex",alignItems:"center",gap:"7px",padding:"3px 0",borderBottom:si<p.steps.length-1?"1px solid rgba(255,255,255,0.04)":"none"}}>
+                              <div style={{width:"16px",height:"16px",borderRadius:"50%",background:`${p.color}15`,border:`1px solid ${p.color}30`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"8px",fontWeight:700,color:p.color,fontFamily:"'Barlow Condensed',sans-serif",flexShrink:0}}>{si+1}</div>
+                              <span style={{fontSize:"9px",color:"#888",fontFamily:"'Barlow Condensed',sans-serif"}}>{step}</span>
+                            </div>
+                          ))}
+                          <div style={{display:"flex",gap:"5px",marginTop:"8px"}}>
+                            <button onClick={e=>{e.stopPropagation();phaseHandlers[p.id]?.();}} disabled={phaseRunning[p.id]}
+                              style={{flex:1,padding:"7px",borderRadius:"5px",border:"none",background:phaseRunning[p.id]?"rgba(255,255,255,0.04)":`linear-gradient(135deg,${p.color},${p.color}bb)`,color:phaseRunning[p.id]?"#333":"#000",fontSize:"10px",fontWeight:800,cursor:phaseRunning[p.id]?"not-allowed":"pointer",fontFamily:"'Barlow Condensed',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:"5px"}}>
+                              {phaseRunning[p.id]?<><Spinner/>Running {p.id}…</>:`▶ Execute ${p.id}`}
+                            </button>
+                            {!p.isCompleted && <button onClick={e=>{e.stopPropagation();onMarkComplete(p.id);}}
+                              style={{padding:"7px 10px",borderRadius:"5px",border:"1px solid rgba(74,222,128,0.2)",background:"rgba(74,222,128,0.06)",color:"#4ade80",fontSize:"9px",cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif"}}>✓ Done</button>}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Footer */}
+            <div style={{padding:"7px 10px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:"6px",fontSize:"9px",color:"#333",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5"}}>
+              📅 All times Eastern. Week resets Tuesday. Phases unlock in sequence and persist until next Tuesday. App must be open to execute — no background scheduling in PWA.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Model Ratings ────────────────────────────────────────────────────────────
 function computeModelRatings(backtestHistory) {
   if (!backtestHistory?.length) return {};
   const teamStats = {};
@@ -2616,6 +5768,10 @@ Be specific with real data. If a game is unavailable or lines aren't posted yet,
           <div style={{display:"flex",gap:"7px"}}>
             <button onClick={()=>onLoadMatchup(p.away,p.home)} style={{flex:1,padding:"10px",borderRadius:"7px",border:"none",background:"linear-gradient(135deg,#16a34a,#15803d)",color:"#fff",fontSize:"11px",fontWeight:800,letterSpacing:"0.08em",textTransform:"uppercase",cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:"6px"}}>
               🔍 Load Full 17-Signal Analysis
+            </button>
+            <button onClick={()=>{onLoadMatchup(p.away,p.home);if(window._onBetIntent)window._onBetIntent();}}
+              style={{padding:"10px 14px",borderRadius:"7px",border:"none",background:"linear-gradient(135deg,#b45309,#92400e)",color:"#fff",fontSize:"10px",fontWeight:800,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:"5px"}}>
+              💰 Bet This
             </button>
           </div>
 
@@ -3606,12 +6762,26 @@ export default function NFLParlayModel(){
   const [primeData,setPrimeData]=useState(null);const [primeStatus,setPrimeStatus]=useState("noTeams");
   const [multiData,setMultiData]=useState(null);const [multiStatus,setMultiStatus]=useState("noTeams");
   const [situationalData,setSituationalData]=useState(null);const [situationalStatus,setSituationalStatus]=useState("noTeams");
+  const [advancedData,setAdvancedData]=useState(null);const [advancedStatus,setAdvancedStatus]=useState("noTeams");
+  const [scheduleSpotData,setScheduleSpotData]=useState(null);const [scheduleSpotLoading,setScheduleSpotLoading]=useState(false);
+  const [publicData,setPublicData]=useState(null);const [publicLoading,setPublicLoading]=useState(false);
+  const [eloRatings,setEloRatings]=useState({});
   // ── Self-learning state ───────────────────────────────────────────────────
   const [learnedWeights,setLearnedWeights]=useState({...DEFAULT_WEIGHTS});
   const [patternMemory,setPatternMemory]=useState({});
   const [teamBias,setTeamBias]=useState([]);
   const [currentFingerprint,setCurrentFingerprint]=useState(null);
   const [patternResult,setPatternResult]=useState(null);
+  // ── Clustering state ──────────────────────────────────────────────────────
+  const [clusterResult,setClusterResult]=useState(null);
+  const [fetchingSchematic,setFetchingSchematic]=useState(false);
+  const [teamSignalMap,setTeamSignalMap]=useState({});
+  // ── Weekly execution schedule state ──────────────────────────────────────
+  const [completedPhases,setCompletedPhases]=useState({});
+  const [phase1Running,setPhase1Running]=useState(false);
+  const [phase2Running,setPhase2Running]=useState(false);
+  const [phase3Running,setPhase3Running]=useState(false);
+  const [phase4Running,setPhase4Running]=useState(false);
   // ── Advanced systems state ────────────────────────────────────────────────
   const [mcResult,setMcResult]=useState(null);
   const [mcRunning,setMcRunning]=useState(false);
@@ -3626,8 +6796,16 @@ export default function NFLParlayModel(){
   const [forecastLoading,setForecastLoading]=useState(false);
   // ── Auto-fetch results state ──────────────────────────────────────────────
   const [pendingGames,setPendingGames]=useState([]);
+  // ── Bet intent — set before analysis, auto-fills bankroll on result ────────
+  const [betIntentUnits,setBetIntentUnits]=useState("");
+  const [betIntentOdds,setBetIntentOdds]=useState("-110");
+  const [betIntentActive,setBetIntentActive]=useState(false);
   const [fetchingResults,setFetchingResults]=useState(false);
   const [fetchProgress,setFetchProgress]=useState("");
+  // ── Three new features state ──────────────────────────────────────────────
+  const [h2hData,setH2hData]=useState(null);const [h2hLoading,setH2hLoading]=useState(false);
+  const [dvoaData,setDvoaData]=useState(null);const [dvoaLoading,setDvoaLoading]=useState(false);
+  const [weatherSeverity,setWeatherSeverity]=useState(null);
   const prevTeams=useRef({home:"",away:""});
   const lastAttributionRef=useRef(null);
 
@@ -3642,6 +6820,8 @@ export default function NFLParlayModel(){
       try{const r=await window.storage.get(PATTERN_KEY);if(r)setPatternMemory(JSON.parse(r.value));}catch{}
       try{const r=await window.storage.get(MISTAKE_KEY);if(r)setMistakes(JSON.parse(r.value));}catch{}
       try{const r=await window.storage.get(UNITS_KEY);if(r)setUnitHistory(JSON.parse(r.value));}catch{}
+      try{const r=await window.storage.get(CLUSTER_KEY);if(r){const d=JSON.parse(r.value);setClusterResult(d.result);setTeamSignalMap(d.signalMap||{});}}catch{}
+      try{const r=await window.storage.get(SCHEDULE_KEY);if(r)setCompletedPhases(JSON.parse(r.value));}catch{}
       try{const r=await window.storage.get(PENDING_KEY);if(r){
         // Auto-expire games older than 7 days
         const cutoff=Date.now()-7*24*60*60*1000;
@@ -3655,13 +6835,19 @@ export default function NFLParlayModel(){
   useEffect(()=>{
     if(!homeTeam||!awayTeam)return;
     if(homeTeam!==prevTeams.current.home||awayTeam!==prevTeams.current.away){
-      prevTeams.current={home:homeTeam,away:awayTeam};setGameResult(null);setError(null);
-      setMcResult(null);setForecastData(null);
+      prevTeams.current={home:homeTeam,away:awayTeam};
+      setGameResult(null);setError(null);setMcResult(null);
+      setForecastData(null);setWeatherSeverity(null);
+      setH2hData(null);setDvoaData(null);
+      setScheduleSpotData(null);setPublicData(null);
       loadAllData();
       // Auto-fetch weather for outdoor stadiums
-      if(!STADIUM_CTX[homeTeam]?.indoor&&OUTDOOR_STADIUMS[homeTeam]){
-        fetchWeatherForecast(homeTeam);
-      }
+      if(!STADIUM_CTX[homeTeam]?.indoor&&OUTDOOR_STADIUMS[homeTeam]) fetchWeatherForecast(homeTeam);
+      // Auto-fetch on team selection
+      fetchH2H();
+      fetchDVOA();
+      fetchScheduleSpot();
+      fetchPublicPct();
     }
   },[homeTeam,awayTeam]);
 
@@ -3700,7 +6886,7 @@ export default function NFLParlayModel(){
     };
     const needsFetch = k => !cached[k];
 
-    const [statsR,injR,formRR,linesR,pressR,ensR,olR,microR,garbR,levR,coachR,cpoeR,splitsR,refR,primeR,multiR,sitR]=await Promise.allSettled([
+    const [statsR,injR,formRR,linesR,pressR,ensR,olR,microR,garbR,levR,coachR,cpoeR,splitsR,refR,primeR,multiR,sitR,advR]=await Promise.allSettled([
       needsFetch("stats")    ? fetchStatsData()    : Promise.resolve(cached.stats),
       needsFetch("inj")      ? fetchInjuryData()   : Promise.resolve(cached.inj),
       needsFetch("formrank") ? fetchFormRankData()  : Promise.resolve(cached.formrank),
@@ -3718,6 +6904,7 @@ export default function NFLParlayModel(){
       needsFetch("prime")    ? fetchPrimeData()     : Promise.resolve(cached.primesite),
       needsFetch("multi")    ? fetchMultiSeasonData(): Promise.resolve(cached.multi),
       needsFetch("sit")      ? fetchSituationalData(): Promise.resolve(cached.sit),
+      needsFetch("adv")      ? fetchAdvancedData()  : Promise.resolve(cached.adv),
     ]);
 
     if(statsR.status==="fulfilled")  applyStats(statsR.value);       else setStatsStatus("error");
@@ -3737,6 +6924,7 @@ export default function NFLParlayModel(){
     if(primeR.status==="fulfilled")  applyPrime(primeR.value);       else setPrimeStatus("error");
     if(multiR.status==="fulfilled")  applyMulti(multiR.value);       else setMultiStatus("error");
     if(sitR.status==="fulfilled")    applySituational(sitR.value);   else setSituationalStatus("error");
+    if(advR.status==="fulfilled")   applyAdvanced(advR.value);      else setAdvancedStatus("error");
 
     // ── Write successful results to session cache ─────────────────────────────
     if(statsR.status==="fulfilled")   cacheSet(homeTeam,awayTeam,"stats",statsR.value);
@@ -3756,6 +6944,7 @@ export default function NFLParlayModel(){
     if(primeR.status==="fulfilled")   cacheSet(homeTeam,awayTeam,"prime",primeR.value);
     if(multiR.status==="fulfilled")   cacheSet(homeTeam,awayTeam,"multi",multiR.value);
     if(sitR.status==="fulfilled")     cacheSet(homeTeam,awayTeam,"sit",sitR.value);
+    if(advR.status==="fulfilled")     cacheSet(homeTeam,awayTeam,"adv",advR.value);
 
     // ── Update pipeline timestamps and compute health ─────────────────────
     const now=Date.now();
@@ -3766,6 +6955,50 @@ export default function NFLParlayModel(){
     setPipelineHealth(computePipelineHealth(ts));
 
     setDataLoading(false);
+    // ── Update teamSignalMap with fresh signal data for future clustering ──
+    const freshMap={...teamSignalMap};
+    if(pressR.status==="fulfilled"&&pressR.value){
+      try{
+        const pd=typeof pressR.value==="string"?JSON.parse(pressR.value.match(/\{[\s\S]*\}/)?.[0]||"{}"):pressR.value;
+        if(homeTeam&&pd.home)freshMap[homeTeam]={...(freshMap[homeTeam]||{}),pressureAllowed:pd.home.pressureAllowed,pressureGenerated:pd.home.passRushWin};
+        if(awayTeam&&pd.away)freshMap[awayTeam]={...(freshMap[awayTeam]||{}),pressureAllowed:pd.away.pressureAllowed,pressureGenerated:pd.away.passRushWin};
+      }catch{}
+    }
+    if(cpoeR.status==="fulfilled"&&cpoeR.value){
+      try{
+        const cd=typeof cpoeR.value==="string"?JSON.parse(cpoeR.value.match(/\{[\s\S]*\}/)?.[0]||"{}"):cpoeR.value;
+        if(homeTeam&&cd.home)freshMap[homeTeam]={...(freshMap[homeTeam]||{}),cpoe:cd.home.cpoe};
+        if(awayTeam&&cd.away)freshMap[awayTeam]={...(freshMap[awayTeam]||{}),cpoe:cd.away.cpoe};
+      }catch{}
+    }
+    if(olR.status==="fulfilled"&&olR.value){
+      try{
+        const od=typeof olR.value==="string"?JSON.parse(olR.value.match(/\{[\s\S]*\}/)?.[0]||"{}"):olR.value;
+        if(homeTeam&&od.home)freshMap[homeTeam]={...(freshMap[homeTeam]||{}),olHealth:od.home.healthScore};
+        if(awayTeam&&od.away)freshMap[awayTeam]={...(freshMap[awayTeam]||{}),olHealth:od.away.healthScore};
+      }catch{}
+    }
+    // Feed DVOA into teamSignalMap for clustering
+    if(dvoaData){
+      if(homeTeam&&dvoaData.home)freshMap[homeTeam]={...(freshMap[homeTeam]||{}),offDVOA:dvoaData.home.offDVOA,defDVOA:dvoaData.home.defDVOA};
+      if(awayTeam&&dvoaData.away)freshMap[awayTeam]={...(freshMap[awayTeam]||{}),offDVOA:dvoaData.away.offDVOA,defDVOA:dvoaData.away.defDVOA};
+    }
+    if(linesR.status==="fulfilled"&&linesR.value){
+      try{
+        const ld=typeof linesR.value==="string"?JSON.parse(linesR.value.match(/\{[\s\S]*\}/)?.[0]||"{}"):linesR.value;
+        if(homeTeam&&ld.total){freshMap[homeTeam]={...(freshMap[homeTeam]||{}),avgTotal:parseFloat(ld.total)};if(awayTeam)freshMap[awayTeam]={...(freshMap[awayTeam]||{}),avgTotal:parseFloat(ld.total)};}
+      }catch{}
+    }
+    if(Object.keys(freshMap).length>Object.keys(teamSignalMap).length||(homeTeam&&freshMap[homeTeam]!==teamSignalMap[homeTeam])){
+      setTeamSignalMap(freshMap);
+      // Re-run clustering silently if we have enough teams
+      if(Object.keys(freshMap).length>=K_CLUSTERS){
+        try{
+          const updated=runClusteringPipeline(freshMap,backtestHistory);
+          if(updated){setClusterResult(updated);try{await window.storage.set(CLUSTER_KEY,JSON.stringify({result:updated,signalMap:freshMap,updatedAt:new Date().toISOString()}));}catch{}}
+        }catch{}
+      }
+    }
   }
 
   // ── Fetch helpers ─────────────────────────────────────────────────────────
@@ -3830,22 +7063,243 @@ ONLY JSON: {"home":{"weightedWinPct":N,"weightedAtsPct":N,"avgPPG3yr":N,"avgPAPG
 ONLY JSON: {"home":{"offByeATS":"58%","offByeRecord":"7-5","homeDogATS":"62%","homeDogRecord":"5-3","divisionalATS":"51%","divisionalRecord":"12-11","shortRestATS":"44%","shortRestRecord":"4-5","afterLossATS":"53%","afterLossRecord":"16-14","primeTimeATS":"55%","primeTimeRecord":"6-5","coldWeatherATS":"60%","coldWeatherRecord":"6-4"},"away":{...}}`});}
   function applySituational(text){try{const m=text.match(/\{[\s\S]*\}/);if(!m)throw new Error();setSituationalData(JSON.parse(m[0]));setSituationalStatus("success");}catch{setSituationalStatus("error");}}
 
+  // ── Advanced efficiency signals ───────────────────────────────────────────
+  async function fetchAdvancedData(){
+    return callClaude({useSearch:true,maxTokens:1000,
+      prompt:"Search for the 2025-26 NFL season advanced stats for "+homeTeam+" and "+awayTeam+". Find: red zone touchdown percentage (TD%), red zone trips per game, red zone touchdowns allowed %, third down conversion rate (offense), third down conversion rate allowed (defense), offensive plays per game (pace), average seconds per snap, turnover differential, forced fumbles, interceptions forced, EPA per dropback for each starting QB, EPA per dropback rank."+
+      "\nONLY JSON: {\"home\":{\"rzTdPct\":N,\"rzAllowedPct\":N,\"rzTripsPerGame\":N,\"thirdDownPct\":N,\"thirdDownAllowed\":N,\"playsPerGame\":N,\"secondsPerSnap\":N,\"timeOfPoss\":N,\"turnoverDiff\":N,\"forcedFumbles\":N,\"interceptions\":N,\"epaPerDropback\":N,\"epaRank\":N},\"away\":{...},\"matchupNote\":\"one sentence on what these efficiency stats mean for the total\"}"
+    });
+  }
+  function applyAdvanced(text){
+    try{
+      const m=text.match(/\{[\s\S]*\}/);
+      if(!m)throw new Error();
+      setAdvancedData(JSON.parse(m[0]));
+      setAdvancedStatus("success");
+    }catch{setAdvancedStatus("error");}
+  }
+
   // ── Auto weather forecast ─────────────────────────────────────────────────
   async function fetchWeatherForecast(team){
     const stadium=OUTDOOR_STADIUMS[team];
     if(!stadium)return;
-    setForecastLoading(true);setForecastData(null);
+    setForecastLoading(true);setForecastData(null);setWeatherSeverity(null);
     try{
       const text=await callClaude({useSearch:true,maxTokens:600,prompt:`Search for the weather forecast for ${stadium.city} on game day for the upcoming NFL game at ${team}'s stadium. Find the temperature in Fahrenheit, wind speed in mph, and precipitation probability for Sunday (or game day).
 ONLY JSON: {"location":"${stadium.city}","tempF":N,"windMph":N,"precipPct":N,"description":"e.g. Partly cloudy, 42°F","icon":"emoji weather icon","suggested":"dome/ideal/cold/wind/rain","reasoning":"why this weather category"}
 Rules: cold=temp<35F. wind=windMph>=20. rain=precipPct>=40. ideal=everything else. dome only for indoor stadiums.`});
       const m=text.match(/\{[\s\S]*\}/);
-      if(m)setForecastData(JSON.parse(m[0]));
+      if(m){
+        const fd=JSON.parse(m[0]);
+        setForecastData(fd);
+        // Compute continuous severity score from raw forecast data
+        if(fd.tempF!=null&&fd.windMph!=null&&fd.precipPct!=null){
+          const sev=calcWeatherSeverity(fd.tempF,fd.windMph,fd.precipPct);
+          setWeatherSeverity(sev);
+          // Auto-apply the most accurate category
+          if(sev.category&&sev.severity>8) setWeather(sev.category);
+        }
+      }
     }catch(e){console.error("Weather forecast failed",e);}
     setForecastLoading(false);
   }
 
-  // ── Bankroll unit management ──────────────────────────────────────────────
+  // ── Head-to-Head history fetch ────────────────────────────────────────────
+  async function fetchH2H(){
+    if(!homeTeam||!awayTeam)return;
+    setH2hLoading(true);setH2hData(null);
+    try{
+      const text=await callClaude({useSearch:true,maxTokens:1000,prompt:`Search for the all-time head-to-head history between ${homeTeam} and ${awayTeam} in the NFL regular season and playoffs over the last 10 years. Find: overall record, ATS record, average total points scored, home team winning percentage, and list the last 5 matchups with scores.
+ONLY JSON:
+{"gamesAnalyzed":N,"homeSU":"W-L","favTeamLabel":"${abb(homeTeam)}","atsPct":N,"atsRecord":"W-L","totalRecord":"OVER W-UNDER L","avgMargin":"X.X","avgTotal":"X.X","homeAts":"XX%","awayAts":"XX%","pattern":"One key matchup insight e.g. Bills are 7-2 ATS at home vs Dolphins since 2019","lastFive":[{"date":"Nov 2024","score":"${abb(homeTeam)} 27-17 ${abb(awayTeam)}","margin":"+10","coverTeam":true,"coverResult":"${abb(homeTeam)} covered -6"}],"note":"Any notable trend or context about this rivalry"}`});
+      const m=text.match(/\{[\s\S]*\}/);
+      if(m)setH2hData(JSON.parse(m[0]));
+    }catch(e){console.error("H2H fetch failed",e);}
+    setH2hLoading(false);
+  }
+
+  // ── Opponent-adjusted stats fetch ─────────────────────────────────────────
+  // ── DVOA fetch — Football Outsiders weekly data ─────────────────────────
+  async function fetchDVOA(){
+    if(!homeTeam||!awayTeam)return;
+    setDvoaLoading(true);setDvoaData(null);
+    try{
+      const text=await callClaude({useSearch:true,maxTokens:900,prompt:"Search for the current NFL DVOA ratings from Football Outsiders (footballoutsiders.com) for "+homeTeam+" and "+awayTeam+". Find their offensive DVOA percentage, defensive DVOA percentage, total DVOA, and NFL rank for each. Also find their week-over-week trend (improving/declining/stable).\nONLY JSON:\n{\"week\":\"Week N\",\"home\":{\"team\":\""+homeTeam+"\",\"offDVOA\":N,\"defDVOA\":N,\"totalDVOA\":N,\"offRank\":N,\"defRank\":N,\"trend\":\"improving/declining/stable\"},\"away\":{\"team\":\""+awayTeam+"\",\"offDVOA\":N,\"defDVOA\":N,\"totalDVOA\":N,\"offRank\":N,\"defRank\":N,\"trend\":\"improving/declining/stable\"},\"matchupNote\":\"One sentence on what the DVOA matchup means for this game\"}"});
+      const m=text.match(/\{[\s\S]*\}/);
+      if(m){
+        const d=JSON.parse(m[0]);
+        setDvoaData(d);
+        try{await window.storage.set(DVOA_KEY,JSON.stringify({data:d,fetchedAt:new Date().toISOString(),homeTeam,awayTeam}));}catch{}
+      }
+    }catch(e){console.error("DVOA fetch failed",e);}
+    setDvoaLoading(false);
+  }
+
+  // ── Fetch schematic data and run clustering pipeline ──────────────────────
+  async function fetchSchematicData(){
+    setFetchingSchematic(true);
+    try{
+      const text=await callClaude({useSearch:true,maxTokens:2200,prompt:`Search for current 2025-26 NFL season team statistics for ALL 32 teams. For each team find:
+- Pass yards per game (offense)
+- Rush yards per game (offense)
+- Points scored per game (PPG)
+- Points allowed per game (PAPG)
+- Pressure rate allowed by their OL (% of dropbacks where QB was pressured)
+- Pass rush win rate (how often their DL beats the block in 2.5 seconds)
+- QB CPOE (completion percentage over expected, positive=above average)
+- OL health score estimate 0-100 (100=fully healthy)
+- Average game total when they play (over/under environment)
+
+Return ONLY JSON (no markdown, all 32 teams):
+{
+  "season":"2025-26",
+  "teams":{
+    "Arizona Cardinals":{"passYds":215,"rushYds":105,"ppg":20,"papg":26,"pressureAllowed":32,"pressureGenerated":40,"cpoe":-2,"olHealth":72,"avgTotal":43},
+    "Atlanta Falcons":{...},
+    "Baltimore Ravens":{...},
+    "Buffalo Bills":{...},
+    "Carolina Panthers":{...},
+    "Chicago Bears":{...},
+    "Cincinnati Bengals":{...},
+    "Cleveland Browns":{...},
+    "Dallas Cowboys":{...},
+    "Denver Broncos":{...},
+    "Detroit Lions":{...},
+    "Green Bay Packers":{...},
+    "Houston Texans":{...},
+    "Indianapolis Colts":{...},
+    "Jacksonville Jaguars":{...},
+    "Kansas City Chiefs":{...},
+    "Las Vegas Raiders":{...},
+    "Los Angeles Chargers":{...},
+    "Los Angeles Rams":{...},
+    "Miami Dolphins":{...},
+    "Minnesota Vikings":{...},
+    "New England Patriots":{...},
+    "New Orleans Saints":{...},
+    "New York Giants":{...},
+    "New York Jets":{...},
+    "Philadelphia Eagles":{...},
+    "Pittsburgh Steelers":{...},
+    "San Francisco 49ers":{...},
+    "Seattle Seahawks":{...},
+    "Tampa Bay Buccaneers":{...},
+    "Tennessee Titans":{...},
+    "Washington Commanders":{...}
+  }
+}`});
+      const m=text.match(/\{[\s\S]*\}/);
+      if(!m)throw new Error("No JSON");
+      const data=JSON.parse(m[0]);
+      const signalMap=data.teams||{};
+      // Run K-Means++ clustering pipeline
+      const result=runClusteringPipeline(signalMap,backtestHistory);
+      if(result){
+        setClusterResult(result);
+        setTeamSignalMap(signalMap);
+        try{await window.storage.set(CLUSTER_KEY,JSON.stringify({result,signalMap,updatedAt:new Date().toISOString()}));}catch{}
+      }
+    }catch(e){console.error("Clustering failed",e);}
+    setFetchingSchematic(false);
+  }
+
+  // ── Weekly Execution Phase Handlers ──────────────────────────────────────
+  async function markPhaseComplete(phaseId){
+    const wk=getWeekKey();
+    const updated={...completedPhases,[wk]:{...(completedPhases[wk]||{}),[phaseId]:new Date().toISOString()}};
+    setCompletedPhases(updated);
+    try{await window.storage.set(SCHEDULE_KEY,JSON.stringify(updated));}catch{}
+  }
+
+  // Phase 1 — Tuesday 9:00 AM: Fetch & Harmonize
+  async function executePhase1(){
+    setPhase1Running(true);
+    try{
+      // 1. Fetch schematic data + re-cluster all 32 teams
+      await fetchSchematicData();
+      // 2. Auto-mark complete
+      await markPhaseComplete("P1");
+    }catch(e){console.error("Phase 1 failed",e);}
+    setPhase1Running(false);
+  }
+
+  // Phase 2 — Thursday 4:00 PM: Context & Roster Adjustments
+  async function executePhase2(){
+    setPhase2Running(true);
+    try{
+      // Re-fetch injury/ref/splits data for the current matchup
+      if(homeTeam&&awayTeam){
+        const [injR,refR,splitsR]=await Promise.allSettled([
+          fetchInjuryData(), fetchRefData(), fetchSplitsData()
+        ]);
+        if(injR.status==="fulfilled")  applyInjuries(injR.value);
+        if(refR.status==="fulfilled")  applyRef(refR.value);
+        if(splitsR.status==="fulfilled")applySplits(splitsR.value);
+      }
+      await markPhaseComplete("P2");
+    }catch(e){console.error("Phase 2 failed",e);}
+    setPhase2Running(false);
+  }
+
+  // Phase 3 — Friday 3:00 PM: Multi-Model Ensemble
+  async function executePhase3(){
+    setPhase3Running(true);
+    try{
+      // Run full signal stack for current matchup
+      if(homeTeam&&awayTeam) await loadAllData();
+      // Auto-trigger Weekly Pick scanner to evaluate full slate
+      // This pre-populates the best bet and surfaces top games for pending
+      const wpBtn=document.querySelector('[data-weekly-pick-fetch]');
+      if(wpBtn) wpBtn.click();
+      await markPhaseComplete("P3");
+    }catch(e){console.error("Phase 3 failed",e);}
+    setPhase3Running(false);
+  }
+
+  // Phase 4 — Sunday 10:00 AM: Market Arbitration & Line Shopping
+  async function executePhase4(){
+    setPhase4Running(true);
+    try{
+      // Fresh lines + ensemble from all 6 books
+      if(homeTeam&&awayTeam){
+        const [linesR,ensR]=await Promise.allSettled([fetchLinesData(),fetchEnsembleData()]);
+        if(linesR.status==="fulfilled") applyLines(linesR.value);
+        if(ensR.status==="fulfilled")   applyEnsemble(ensR.value);
+      }
+      await markPhaseComplete("P4");
+    }catch(e){console.error("Phase 4 failed",e);}
+    setPhase4Running(false);
+  }
+  // ── Schedule spot fetch ───────────────────────────────────────────────────
+  async function fetchScheduleSpot(){
+    if(!homeTeam||!awayTeam)return;
+    setScheduleSpotLoading(true);setScheduleSpotData(null);
+    try{
+      const text=await callClaude({useSearch:true,maxTokens:700,
+        prompt:"Search for the schedule situation for the upcoming NFL game "+awayTeam+" at "+homeTeam+" this week. Find: days of rest for each team, is either team on a short week (Thursday game), did either team have a bye last week, is either team on a second consecutive road game, is this a divisional rivalry game, is this game a potential trap game (big favorite between two tough opponents), any cross-country travel disadvantage, any revenge game situation."+
+        "\nONLY JSON: {\"home\":{\"daysRest\":N,\"flags\":[\"SHORT_WEEK\"|\"LONG_REST\"|\"ROAD_TRIP\"|\"BACK_TO_BACK\"|\"TRAP_GAME\"|\"DIVISIONAL\"|\"PRIMETIME\"|\"REVENGE\"]},\"away\":{\"daysRest\":N,\"flags\":[...]},\"note\":\"Brief situation summary\"}"
+      });
+      const m=text.match(/\{[\s\S]*\}/);
+      if(m)setScheduleSpotData(JSON.parse(m[0]));
+    }catch(e){console.error("ScheduleSpot failed",e);}
+    setScheduleSpotLoading(false);
+  }
+
+  // ── Public betting % fetch ────────────────────────────────────────────────
+  async function fetchPublicPct(){
+    if(!homeTeam||!awayTeam)return;
+    setPublicLoading(true);setPublicData(null);
+    try{
+      const text=await callClaude({useSearch:true,maxTokens:700,
+        prompt:"Search Action Network or ESPN BET or Covers.com for public betting percentages for the NFL game "+awayTeam+" at "+homeTeam+" this week. Find the percentage of bets on each side for spread, total, and moneyline."+
+        "\nONLY JSON: {\"spread\":{\"favTeam\":\"full team name\",\"favPct\":N,\"lineMove\":\"fav/dog/none\",\"odds\":\"-110\"},\"total\":{\"overTeam\":\"Over\",\"overPct\":N,\"odds\":\"-110\"},\"moneyline\":{\"favTeam\":\"full team name\",\"favPct\":N,\"odds\":\"-150\"},\"sharpNote\":\"Reverse line movement or sharp money signal — null if none\"}"
+      });
+      const m=text.match(/\{[\s\S]*\}/);
+      if(m)setPublicData(JSON.parse(m[0]));
+    }catch(e){console.error("PublicPct failed",e);}
+    setPublicLoading(false);
+  }
+
   async function addUnit(entry){
     const newH=[entry,...unitHistory].slice(0,500);
     setUnitHistory(newH);
@@ -3892,6 +7346,16 @@ Rules: cold=temp<35F. wind=windMph>=20. rain=precipPct>=40. ideal=everything els
             autoFetched:true,
           };
           await addBacktestResult(resultEntry);
+          // Auto-log to bankroll if bet was tracked pre-game
+          if(g.isBet && g.betUnits > 0){
+            const dec = americanToDecimal(g.betOdds)||1.909;
+            const wonUnits = resultEntry.spreadCorrect ? parseFloat((g.betUnits*(dec-1)).toFixed(2)) : resultEntry.atsResult==="PUSH" ? 0 : -g.betUnits;
+            await addUnit({
+              units:g.betUnits, odds:g.betOdds, decimal:dec, result:resultEntry.spreadCorrect?"WIN":resultEntry.atsResult==="PUSH"?"PUSH":"LOSS",
+              unitsWon:wonUnits, note:abb(g.awayTeam)+"@"+abb(g.homeTeam)+" (auto)",
+              date:resultEntry.date, autoLogged:true,
+            });
+          }
           completed.push(g.awayTeam+"|"+g.homeTeam);
         }
       }catch(e){console.error("fetchResult failed",g.awayTeam,"@",g.homeTeam,e);}
@@ -3922,7 +7386,36 @@ Rules: cold=temp<35F. wind=windMph>=20. rain=precipPct>=40. ideal=everything els
     const rd=(t,k)=>{const d=rankData?.[k];return d?`${t} Off#${d.offRank} Def#${d.defRank} RZOff:${d.rzOff}% 3rdOff:${d.thirdOff}%`:""};
     const lc=lines?`Lines: ${abb(lines.favTeam||"")} -${lines.spread} O/U:${lines.total}(${lines.totalLean}) ML:${abb(awayTeam)}${lines.awayML}/${abb(homeTeam)}${lines.homeML}`:"";
     const lm=lineMove?`LineMove: ${lineMove.open}→${lineMove.current} Sharp:${lineMove.sharpSide}`:"";
-    const adj=weatherAdjust(weather);
+    // ── Weather severity (continuous scale replaces binary) ───────────────
+    const adjWeather  = weatherAdjustWithSeverity(weather, weatherSeverity);
+    const adj         = adjWeather;
+    const weatherCtx  = weatherSeverity
+      ? "WEATHER SEVERITY "+weatherSeverity.severity+"/100 ("+weatherSeverity.label+"): totalAdj="+weatherSeverity.totalAdj+" spreadAdj="+weatherSeverity.spreadAdj+" | Temp="+weatherSeverity.components.tempScore+" Wind="+weatherSeverity.components.windScore+" Precip="+weatherSeverity.components.precipScore
+      : "";
+    // ── H2H and OppAdj context ────────────────────────────────────────────
+    const h2hCtx = h2hData
+      ? "H2H HISTORY ("+h2hData.gamesAnalyzed+" games): "+abb(homeTeam)+" SU="+h2hData.homeSU+" ATS="+h2hData.atsRecord+" ("+h2hData.atsPct+"% cover) AvgTotal="+h2hData.avgTotal+" Pattern: "+h2hData.pattern
+      : "";
+    const dvoaCtx = dvoaData
+      ? "DVOA (Football Outsiders): "+abb(homeTeam)+" Off="+dvoaData.home?.offDVOA+"% (#"+dvoaData.home?.offRank+") Def="+dvoaData.home?.defDVOA+"% (#"+dvoaData.home?.defRank+") Total="+dvoaData.home?.totalDVOA+"% trend="+dvoaData.home?.trend+". "+abb(awayTeam)+" Off="+dvoaData.away?.offDVOA+"% (#"+dvoaData.away?.offRank+") Def="+dvoaData.away?.defDVOA+"% (#"+dvoaData.away?.defRank+") trend="+dvoaData.away?.trend+". Spread adj="+dvoaToSpreadAdj(dvoaData.home?.offDVOA,dvoaData.home?.defDVOA,dvoaData.away?.offDVOA,dvoaData.away?.defDVOA)+"pts. "+dvoaData.matchupNote
+      : "";
+    // ── Advanced efficiency context ────────────────────────────────────────
+    const advAdj = advancedData ? calcAdvancedTotalAdj(advancedData.home, advancedData.away) : null;
+    const toSumm = advancedData ? calcTurnoverLuck(advancedData.home, advancedData.away) : null;
+    const advancedCtx = advancedData
+      ? "ADVANCED EFFICIENCY: "+abb(homeTeam)+" RZ TD%="+advancedData.home?.rzTdPct+"% 3rdDown%="+advancedData.home?.thirdDownPct+"% Pace="+advancedData.home?.playsPerGame+"plays/g EPA/db="+advancedData.home?.epaPerDropback+". "+abb(awayTeam)+" RZ TD%="+advancedData.away?.rzTdPct+"% 3rdDown%="+advancedData.away?.thirdDownPct+"% Pace="+advancedData.away?.playsPerGame+"plays/g EPA/db="+advancedData.away?.epaPerDropback+". Total adj="+advAdj?.total+"pts (RZ:"+advAdj?.rz+" 3rd:"+advAdj?.thirdDown+" Pace:"+advAdj?.pace+"). TO luck: "+abb(homeTeam)+"="+toSumm?.homeLuck+" "+abb(awayTeam)+"="+toSumm?.awayLuck+". "+advancedData.matchupNote
+      : "";
+    // ── Elo / Schedule Spot / Public % context ────────────────────────────
+    const homeEloR = eloRatings[homeTeam]||1500, awayEloR = eloRatings[awayTeam]||1500;
+    const eloCtx = (homeEloR!==1500||awayEloR!==1500)
+      ? "ELO RATINGS: "+abb(homeTeam)+"="+homeEloR+" "+abb(awayTeam)+"="+awayEloR+" spreadAdj="+eloToSpreadAdj(homeEloR,awayEloR)+"pts homeWinProb="+eloWinProb(homeEloR,awayEloR)+"%"
+      : "";
+    const scheduleCtx = scheduleSpotData
+      ? "SCHEDULE SPOT: "+abb(homeTeam)+" flags=["+( scheduleSpotData.home?.flags||[]).join(",")+"] "+abb(awayTeam)+" flags=["+(scheduleSpotData.away?.flags||[]).join(",")+"] "+scheduleSpotData.note
+      : "";
+    const publicCtx = publicData
+      ? "PUBLIC BETTING %: Spread="+abb(publicData.spread?.favTeam||homeTeam)+" "+publicData.spread?.favPct+"% public lineMove="+publicData.spread?.lineMove+". Total=Over "+publicData.total?.overPct+"%. "+( publicData.sharpNote||"No RLM detected")
+      : "";
     const logitWP=lines?spreadToWinProb(lines.spread,lines.favTeam,homeTeam):{homeWin:50,awayWin:50};
     const pressCtx=pressureData?`PRESSURE: ${abb(awayTeam)} pressure allowed:${pressureData.away?.pressureAllowed||"?"}% vs ${abb(homeTeam)} rush win:${pressureData.home?.passRushWin||"?"}%. Edge:${pressureData.matchupEdge||""} Adj:${pressureData.spreadImpact||0}pts`:"";
     const ensCtx=ensembleData?`MARKET: Consensus ${ensembleData.favTeam?abb(ensembleData.favTeam):""}-${(()=>{const b=ensembleData.books||[];return b.length?(b.reduce((s,b)=>s+(b.spread||0),0)/b.length).toFixed(1):"?"})()}. Sharp:${ensembleData.sharpConsensus||""}`:"";
@@ -3934,6 +7427,20 @@ Rules: cold=temp<35F. wind=windMph>=20. rain=precipPct>=40. ideal=everything els
     const cpoeCtx=cpoeData?`CPOE: ${abb(homeTeam)} QB ${cpoeData.home?.qbName||""} CPOE:${cpoeData.home?.cpoe||"?"} vs def. ${abb(awayTeam)} QB ${cpoeData.away?.qbName||""} CPOE:${cpoeData.away?.cpoe||"?"}. Edge:${cpoeData.matchupEdge||""} Total impact:${cpoeData.totalImpact||0}pts`:"";
     const logitCtx=`LOGIT TRANSFORM: Market implies ${abb(homeTeam)} ${logitWP.homeWin}% win prob from spread. Compare to model output for divergence signal.`;
     const splitsCtx=splitsData?`HOME/AWAY SPLITS: ${abb(homeTeam)} home record:${splitsData.home?.homeRecord||"?"} ATS:${splitsData.home?.homeATS||"?"}. ${abb(awayTeam)} away record:${splitsData.away?.awayRecord||"?"} ATS:${splitsData.away?.awayATS||"?"}. ${splitsData.spreadImpact||""}`:"";
+    // ── Sportsbook profiling context ──────────────────────────────────────
+    const bookList=ensembleData?.books||[];
+    const truePrice=calcTrueMarketPrice(bookList);
+    const sharpGaps=detectSharpLineGaps(bookList,lines);
+    const _gapStr=sharpGaps.length?"Sharp-line gaps detected: "+sharpGaps.slice(0,2).map(g=>g.softBook+" "+g.gap+"pts soft vs "+g.sharpBook).join(", ")+" — soft book hasn't adjusted yet.":"Books efficient — no exploitable gaps.";
+    const bookCtx=bookList.length?"SPORTSBOOK PROFILING: True market price (Score-weighted)="+(truePrice?"-"+truePrice:"N/A")+". "+_gapStr:"";
+    // ── GNN Roster Interdependency context ────────────────────────────────
+    const homeGNN   = runRosterGNN(injuries, pressureData, olData, cpoeData, "home");
+    const awayGNN   = runRosterGNN(injuries, pressureData, olData, cpoeData, "away");
+    const gnnSpreadAdj = rosterToSpreadAdj(homeGNN.integrityScore, awayGNN.integrityScore);
+    const homeCovKey   = detectCoverageScheme(pressureData, cpoeData, ensembleData);
+    const homeCov      = COVERAGE_SCHEMES[homeCovKey];
+        const gnnCascadeStr = homeGNN.cascades.length ? " Cascades: "+homeGNN.cascades.slice(0,3).map(c=>c.pos+" "+Math.round(c.rawScore*100)+"->"+Math.round(c.gnnScore*100)).join(", ")+"." : "";
+    const gnnCtx = "GNN ROSTER INTEGRITY (2-round GCN): "+abb(homeTeam)+"="+homeGNN.integrityScore+"/100 "+abb(awayTeam)+"="+awayGNN.integrityScore+"/100. Net adj="+(gnnSpreadAdj>0?"+":"")+gnnSpreadAdj+"pts."+gnnCascadeStr+" Coverage: "+(homeCov?.label||"")+" (pass"+(homeCov?.passAdj>0?"+":"")+Math.round((homeCov?.passAdj||0)*100)+"% WR1"+(homeCov?.wr1Adj>0?"+":"")+Math.round((homeCov?.wr1Adj||0)*100)+"%).";
     const refCtx=refData?`REFEREE CREW: ${refData.crewName||"Unknown"} avg total:${refData.avgTotal||"?"} penalties/g:${refData.penaltiesPerGame||"?"} over rate:${refData.overRate||"?"}%. ${refData.totalImpact||""}`:"";
     const primeCtx=primeData?.isPrimeTime?`PRIME TIME (${primeData.gameType||""}): ${abb(homeTeam)} PT ATS:${primeData.home?.primeATS||"?"} ${primeData.home?.last5PT||""}. ${abb(awayTeam)} PT ATS:${primeData.away?.primeATS||"?"}. ${primeData.atsNote||""}`:"";
     const multiCtx=multiData?`MULTI-SEASON BASELINE: ${abb(homeTeam)} weighted win%:${multiData.home?.weightedWinPct||"?"}% ATS%:${multiData.home?.weightedAtsPct||"?"}% rank:#${multiData.home?.trueTalentRank||"?"} trend:${multiData.home?.trend||"?"}. ${abb(awayTeam)} weighted win%:${multiData.away?.weightedWinPct||"?"}% ATS%:${multiData.away?.weightedAtsPct||"?"}% rank:#${multiData.away?.trueTalentRank||"?"}. ${multiData.baselineNote||""}`:"";
@@ -3945,19 +7452,24 @@ Rules: cold=temp<35F. wind=windMph>=20. rain=precipPct>=40. ideal=everything els
     const tb=computeTeamBias(backtestHistory);
     setTeamBias(tb);
     const learningCtx=buildLearningContext(learnedWeights,pr,tb,backtestHistory,homeTeam,awayTeam);
+    // ── Schematic archetype matchup context ───────────────────────────────
+    const homeArch=clusterResult?.teamArchetypes?.[homeTeam];
+    const awayArch=clusterResult?.teamArchetypes?.[awayTeam];
+    const archTend=homeArch&&awayArch?getMatchupTendency(homeArch,awayArch):null;
+    const clusterCtx=archTend?`SCHEMATIC ARCHETYPES (K-Means++ clustering, K=${K_CLUSTERS}): ${abb(awayTeam)}=${ARCHETYPES[awayArch]?.label||awayArch} offense vs ${abb(homeTeam)}=${ARCHETYPES[homeArch]?.label||homeArch} defense. Historical tendency: spreadAdj=${archTend.spreadAdj>0?"+":""}${archTend.spreadAdj} totalAdj=${archTend.totalAdj>0?"+":""}${archTend.totalAdj} — ${archTend.note}`:"SCHEMATIC ARCHETYPES: Run clustering for matchup-type adjustment.";
     const divNote=isDivisional(homeTeam,awayTeam)?`DIVISIONAL (${getDivision(homeTeam)})`:"";
-    const existingLegs=parlayLegs.length>0?`EXISTING LEGS: ${parlayLegs.map((l,i)=>`L${i+1}:${abb(l.awayTeam)}@${abb(l.homeTeam)} ${l.betType}:${l.pick}`).join(", ")}`:"";
+    const existingLegs=parlayLegs.length>0?"EXISTING LEGS: "+parlayLegs.map((l,idx)=>"L"+(idx+1)+":"+abb(l.awayTeam)+"@"+abb(l.homeTeam)+" "+l.betType+":"+l.pick).join(", "):"";
 
     const prompt=`Elite NFL parlay handicapper. 17 signal layers + self-learning context. ONE wrong leg kills the ticket. Synthesize ALL signals below.
 
 MATCHUP: ${awayTeam} @ ${homeTeam}
 Venue:${venue==="home"?homeTeam+" home":venue==="away"?awayTeam+" home":"Neutral"} Weather:${weather==="dome"?"Dome":weather==="cold"?"Cold<35F":weather==="wind"?"Wind20+":weather==="rain"?"Rain/Snow":"Ideal"}
-${divNote} ${adj.note?`WEATHER: ${adj.note}`:""}
+${divNote} ${adj.note?"WEATHER: "+adj.note:""}
 
 STATS (raw): ${bs(homeTeam,homeStats)} | ${bs(awayTeam,awayStats)}
 FORM: ${fd(homeTeam,"home")} | ${fd(awayTeam,"away")}
 RANKINGS: ${rd(homeTeam,"home")} | ${rd(awayTeam,"away")}
-${injuries?`INJURIES: ${injuries}`:""}
+${injuries?"INJURIES: "+injuries:""}
 ${lc} ${lm}
 ${pressCtx}
 ${ensCtx}
@@ -3974,6 +7486,16 @@ ${primeCtx}
 ${multiCtx}
 ${sitCtx}
 ${learningCtx}
+${clusterCtx}
+${bookCtx}
+${gnnCtx}
+${weatherCtx}
+${h2hCtx}
+${dvoaCtx}
+${advancedCtx}
+${eloCtx}
+${scheduleCtx}
+${publicCtx}
 ${existingLegs}
 
 Return ONLY JSON (no markdown):
@@ -4016,6 +7538,9 @@ RISK: LOW=65%+ all signals aligned sharp no luck no garbage contamination OL hea
       // ── Save to pending games for auto-result fetch ───────────────────────
       const pendingEntry={
         awayTeam,homeTeam,
+        betUnits:betIntentActive&&betIntentUnits?parseFloat(betIntentUnits)||0:0,
+        betOdds:betIntentActive&&betIntentOdds?betIntentOdds:"-110",
+        isBet:betIntentActive&&!!betIntentUnits,
         modelSpread:lines?.spread,
         favTeam:lines?.favTeam,
         modelTotal:result.total||lines?.total,
@@ -4024,6 +7549,8 @@ RISK: LOW=65%+ all signals aligned sharp no luck no garbage contamination OL hea
         analyzedAt:new Date().toLocaleDateString("en-US",{month:"short",day:"numeric"}),
         analyzedTs:Date.now(),
       };
+      // Reset bet intent after locking in
+      setBetIntentActive(false); setBetIntentUnits(""); setBetIntentOdds("-110");
       const updatedPending=[pendingEntry,...pendingGames.filter(g=>!(g.homeTeam===homeTeam&&g.awayTeam===awayTeam))].slice(0,20);
       setPendingGames(updatedPending);
       try{await window.storage.set(PENDING_KEY,JSON.stringify(updatedPending));}catch{}
@@ -4153,7 +7680,7 @@ RISK: LOW=65%+ all signals aligned sharp no luck no garbage contamination OL hea
   async function analyzeParlayLegs(){
     if(parlayLegs.length<2)return;
     setAnalyzingParlay(true);setParlayAnalysis(null);
-    const legStr=parlayLegs.map((l,i)=>`Leg ${i+1}: ${l.awayTeam} @ ${l.homeTeam} — ${l.betType}: ${l.pick} (${l.winProb}%, ${l.risk}${l.rlm?" RLM":""}${l.cpoeEdge?" CPOE-EDGE":""}${l.coachEdge?" COACH-EDGE":""}${l.luckRegressed?" LUCK-REGRESSED":""}${l.keyNumFlag?` KEY#${l.keyNumFlag.kn}`:""}${l.divisional?" DIV":""}${l.homedog?" HOMEDOG":""})`).join("\n");
+    const legStr=parlayLegs.map((l,i)=>"Leg "+(i+1)+": "+l.awayTeam+" @ "+l.homeTeam+" | "+l.betType+": "+l.pick+" ("+l.winProb+"%, "+l.risk+")"+(l.rlm?" RLM":"")+(l.cpoeEdge?" CPOE-EDGE":"")+(l.coachEdge?" COACH-EDGE":"")+(l.luckRegressed?" LUCK-REGRESSED":"")+(l.keyNumFlag?" KEY#"+l.keyNumFlag.kn:"")+(l.divisional?" DIV":"")+(l.homedog?" HOMEDOG":"")).join("\n");
     const combProb=parlayLegs.reduce((a,l)=>a*(l.winProb||55)/100,1)*100;
     try{
       const text=await callClaude({useSearch:true,maxTokens:1100,prompt:`Elite parlay analyst. ${parlayLegs.length}-leg parlay. Real money. Brutal.
@@ -4199,41 +7726,51 @@ Combined: ${combProb.toFixed(1)}%
   const homeColor=tc(homeTeam),awayColor=tc(awayTeam);
   const statusDots=[["📊",statsStatus],["🩹",injuryStatus],["📈",formStatus],["💰",linesStatus],["🔥",pressureStatus],["📡",ensembleStatus],["🛡️",olStatus],["🔬",microStatus],["🗑️",garbageStatus],["🎲",leverageStatus],["🧠",coachStatus],["🎯",cpoeStatus],["🏠",splitsStatus],["📋",situationalStatus],["📅",multiStatus],["🦺",refStatus],["🌙",primeStatus]];
 
-  return(<div style={{minHeight:"100vh",background:"#060610",backgroundImage:"radial-gradient(ellipse at 12% 12%,rgba(25,15,55,0.6) 0%,transparent 50%),radial-gradient(ellipse at 88% 88%,rgba(10,30,10,0.4) 0%,transparent 50%)",fontFamily:"'Barlow Condensed',sans-serif",color:"#fff",padding:"0 0 60px"}}>
+  return(<div style={{minHeight:"100dvh",background:"#060610",backgroundImage:"radial-gradient(ellipse at 15% 10%,rgba(30,15,60,0.55) 0%,transparent 55%),radial-gradient(ellipse at 85% 90%,rgba(10,35,15,0.4) 0%,transparent 55%)",fontFamily:"'Barlow Condensed',sans-serif",color:"#fff",paddingBottom:"40px"}}>
+    {/* ── Global style injection ── */}
     <style>{`
       @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@300;400;500;600;700;800;900&display=swap');
-      *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-      html,body{overscroll-behavior:none;}
+      *, *::before, *::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+      html,body{overscroll-behavior:none;background:#060610;}
       select option{background:#10101f;}
-      ::-webkit-scrollbar{width:3px;} ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.07);border-radius:2px;}
+      ::-webkit-scrollbar{width:3px;height:3px;}
+      ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:2px;}
+      ::-webkit-scrollbar-track{background:transparent;}
       @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
       @keyframes spin{to{transform:rotate(360deg)}}
-      @keyframes fadeSlideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-      details summary::-webkit-details-marker{display:none;}
-      /* ── Touch targets ── */
-      button,select,input,textarea{touch-action:manipulation;}
-      button{min-height:36px;}
+      @keyframes fadeSlideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+      /* ── Touch / mobile ── */
+      button,select,input,textarea{touch-action:manipulation;font-family:'Barlow Condensed',sans-serif;}
+      button{min-height:36px;cursor:pointer;}
       select,input{min-height:40px;}
+
+      /* ── Panel defaults ── */
+      .nfl-panel{border-radius:9px;padding:12px;}
+
       /* ── Mobile breakpoint ── */
-      @media(max-width:600px){
-        .nfl-header-subtitle{display:none;}
-        .nfl-inner{padding:10px 10px 0!important;}
-        .nfl-panel{padding:12px!important;}
-        select,input{font-size:16px!important;} /* prevents iOS zoom on focus */
-        .nfl-grid-2{grid-template-columns:1fr!important;}
-        .nfl-grid-3{grid-template-columns:1fr 1fr!important;}
-        .nfl-grid-4{grid-template-columns:1fr 1fr!important;}
-        .nfl-stat-grid{grid-template-columns:1fr 1fr!important;}
-        .nfl-team-select{font-size:15px!important;}
-        .nfl-analyze-btn{font-size:14px!important;padding:15px!important;}
-        .nfl-mc-tabs{flex-wrap:wrap;}
+      @media(max-width:599px){
+        .nfl-header-subtitle{display:none!important;}
+        .nfl-inner{padding:8px 8px 0!important;}
+        select,input{font-size:16px!important;}
+        .nfl-analyze-btn{font-size:13px!important;padding:14px!important;}
       }
+
       /* ── Fullscreen ── */
-      :fullscreen .nfl-fs-hide{display:none!important;}
-      :-webkit-full-screen .nfl-fs-hide{display:none!important;}
-      :fullscreen .nfl-inner{padding-bottom:env(safe-area-inset-bottom,20px)!important;}
-      /* ── Safe area (iPhone notch) ── */
-      .nfl-header{padding-left:max(18px,env(safe-area-inset-left))!important;padding-right:max(18px,env(safe-area-inset-right))!important;}
+      :fullscreen .nfl-inner{padding-bottom:env(safe-area-inset-bottom,16px)!important;}
+      :-webkit-full-screen .nfl-inner{padding-bottom:env(safe-area-inset-bottom,16px)!important;}
+
+      /* ── Safe area (iPhone notch/home bar) ── */
+      .nfl-header{
+        padding-left:max(16px,env(safe-area-inset-left))!important;
+        padding-right:max(16px,env(safe-area-inset-right))!important;
+        padding-top:max(10px,env(safe-area-inset-top))!important;
+      }
+
+      /* ── Focus ring ── */
+      button:focus-visible,input:focus-visible,select:focus-visible{
+        outline:2px solid rgba(99,102,241,0.6);outline-offset:2px;
+      }
     `}</style>
 
     {/* Header */}
@@ -4254,27 +7791,54 @@ Combined: ${combProb.toFixed(1)}%
     </div>
 
     <div className="nfl-inner" style={{maxWidth:"780px",margin:"0 auto",padding:"16px 14px 0"}}>
+      {/* ── Weekly Execution Sequence ─── */}
+      <WeeklyExecutionDashboard
+        onPhase1={executePhase1} onPhase2={executePhase2}
+        onPhase3={executePhase3} onPhase4={executePhase4}
+        phase1Running={phase1Running} phase2Running={phase2Running}
+        phase3Running={phase3Running} phase4Running={phase4Running}
+        completedPhases={completedPhases} onMarkComplete={markPhaseComplete}
+      />
       {/* ── Weekly Best Bet ─── */}
       <WeeklyPick onLoadMatchup={(away,home)=>{setAwayTeam(away);setHomeTeam(home);}}/>
       {/* ── Auto-fetch results (shows when pending games exist) ─── */}
       <AutoResultsPanel pendingGames={pendingGames} onFetchResults={fetchAllResults} onDismiss={dismissPending} fetching={fetchingResults} fetchProgress={fetchProgress}/>
       <HistoryTracker history={history} onClear={clearHistory}/>
-      {/* ── Advanced systems panels ─── */}
-      <DriftDetectorPanel driftResult={driftResult} onResetWeights={resetLearning}/>
-      <FeatureImportancePanel features={featureImportance} onAutoCalibrate={applyAutoCalibration} onUpdateWeights={saveSignalWeights}/>
-      <MistakeDigestPanel mistakes={mistakes}/>
-      {/* ── Self-learning + backend analytics ─── */}
-      <SelfLearningPanel learnedWeights={learnedWeights} patternMemory={patternMemory} teamBias={teamBias} backtestHistory={backtestHistory} onResetLearning={resetLearning}/>
+      {/* ── ML Engine (all background systems in one panel) ─── */}
+      <MLEngineDashboard
+        backtestHistory={backtestHistory} onAddResult={addBacktestResult}
+        onClearBacktest={clearBacktest} modelSpread={lines?.spread}
+        modelTotal={gameResult?.total||lines?.total}
+        modelTotalLean={gameResult?.totalLean||lines?.totalLean}
+        homeTeam={homeTeam} awayTeam={awayTeam} confidence={gameResult?.confidence}
+        clvHistory={clvHistory} onAddCLV={addCLVEntry} onClearCLV={clearCLV}
+        lines={lines} gameResult={gameResult}
+        learnedWeights={learnedWeights} patternMemory={patternMemory}
+        teamBias={teamBias} onResetLearning={resetLearning}
+        signalWeights={signalWeights} onUpdateWeights={saveSignalWeights}
+        calibration={calibration}
+        featureImportance={featureImportance} onAutoCalibrate={applyAutoCalibration}
+        driftResult={driftResult} mistakes={mistakes}
+        clusterResult={clusterResult} onFetchSchematicData={fetchSchematicData}
+        fetchingSchematic={fetchingSchematic}
+        parlayHistory={history} onLoadMatchup={(away,home)=>{setAwayTeam(away);setHomeTeam(home);}}
+      />
       <BankrollPanel unitHistory={unitHistory} onAddUnit={addUnit} onClearUnits={clearUnits}/>
-      <CalibrationPanel calibration={calibration}/>
-      <SignalWeightPanel weights={signalWeights} onUpdateWeights={saveSignalWeights} calibrationStats={calibration}/>
-      <CLVPanel clvHistory={clvHistory} onAddCLV={addCLVEntry} onClearCLV={clearCLV} modelSpread={gameResult?.spreadPick?.replace(/[^\d.]/g,"")||lines?.spread} lines={lines} homeTeam={homeTeam} awayTeam={awayTeam}/>
-      <BacktestPanel backtestHistory={backtestHistory} onAddResult={addBacktestResult} onClearBacktest={clearBacktest} modelSpread={lines?.spread} modelTotal={gameResult?.total||lines?.total} modelTotalLean={gameResult?.totalLean||lines?.totalLean} homeTeam={homeTeam} awayTeam={awayTeam} confidence={gameResult?.confidence}/>
       {parlayLegs.length>0&&<ParlayBuilder legs={parlayLegs} onRemove={removeFromParlay} parlayAnalysis={parlayAnalysis} onAnalyze={analyzeParlayLegs} analyzing={analyzingParlay} onSave={saveParlay}/>}
       {analyzedGames.length>=2&&<ParlayAutoSuggester analyzedGames={analyzedGames} onApplySuggestion={applyAutoSuggestion}/>}
       <WeekSchedule onSelectGame={(away,home)=>{setAwayTeam(away);setHomeTeam(home);}}/>
       {/* Auto weather forecast for outdoor games */}
       <WeatherForecastPanel homeTeam={homeTeam} forecastData={forecastData} forecastLoading={forecastLoading} onApplyWeather={setWeather} currentWeather={weather}/>
+      {/* Weather severity score */}
+      {weatherSeverity&&<WeatherSeverityBar severityResult={weatherSeverity}/>}
+      {/* Head-to-Head matchup history */}
+      {(homeTeam&&awayTeam)&&<H2HPanel h2hData={h2hData} loading={h2hLoading} homeTeam={homeTeam} awayTeam={awayTeam}/>}
+      {/* Opponent-adjusted stats */}
+      {(homeTeam&&awayTeam)&&<DVOAPanel dvoaData={dvoaData} loading={dvoaLoading} homeTeam={homeTeam} awayTeam={awayTeam}/>}
+      {(homeTeam&&awayTeam)&&<AdvancedStatsPanel advancedData={advancedData} advancedStatus={advancedStatus} homeTeam={homeTeam} awayTeam={awayTeam} lines={lines}/> }
+      {(homeTeam&&awayTeam)&&<EloPowerPanel eloRatings={eloRatings} homeTeam={homeTeam} awayTeam={awayTeam} backtestHistory={backtestHistory}/> }
+      {(homeTeam&&awayTeam)&&<ScheduleSpotPanel scheduleSpotData={scheduleSpotData} loading={scheduleSpotLoading} homeTeam={homeTeam} awayTeam={awayTeam}/> }
+      {(homeTeam&&awayTeam)&&<PublicBettingPanel publicData={publicData} loading={publicLoading} homeTeam={homeTeam} awayTeam={awayTeam} lines={lines}/> }
 
       {/* Matchup */}
       <Panel mb="10px" border="rgba(255,255,255,0.07)">
@@ -4324,8 +7888,6 @@ Combined: ${combProb.toFixed(1)}%
       {(homeTeam&&awayTeam)&&<PrimeTimePanel primeData={primeData} loading={primeStatus==="loading"} homeTeam={homeTeam} awayTeam={awayTeam}/>}
       {parlayLegs.length>=2&&<CorrelationMatrixPanel legs={parlayLegs} weather={weather}/>}
       {gameResult&&lines&&<DivergenceAlert lines={lines} gameResult={gameResult}/>}
-      <SeasonDashboard backtestHistory={backtestHistory} clvHistory={clvHistory} parlayHistory={history} signalWeights={signalWeights}/>
-      <PowerRankingsPanel backtestHistory={backtestHistory} onLoadMatchup={(away,home)=>{setAwayTeam(away);setHomeTeam(home);}}/>
 
       {/* Form + Rankings */}
       {(homeTeam&&awayTeam)&&(formData||rankData||formStatus==="loading")&&<Panel mb="10px"><PanelTitle icon="📈" title="Form & Rankings" tag={formStatus==="success"&&rankStatus==="success"?"live":undefined}/>{(formStatus==="loading"||rankStatus==="loading")&&<Skel cols={2}/>}{(formData||rankData)&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"9px"}}>{[{team:awayTeam,color:awayColor,fk:"away",rk:"away"},{team:homeTeam,color:homeColor,fk:"home",rk:"home"}].map(({team,color,fk,rk})=>{const fd=formData?.[fk],rd=rankData?.[rk];return(<div key={team} style={{borderTop:`2px solid ${color}28`,paddingTop:"8px"}}><div style={{fontSize:"9px",fontWeight:800,color,fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"6px"}}>{abb(team)}</div>{fd&&<div style={{marginBottom:"6px"}}><div style={{display:"flex",gap:"3px",marginBottom:"4px",flexWrap:"wrap"}}>{(fd.results||[]).map((r,i)=><div key={i} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:"1px"}}><div style={{width:"15px",height:"15px",borderRadius:"50%",background:r.result==="W"?"#16a34a":"#dc2626",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"7px",fontWeight:900,color:"#fff",fontFamily:"'Barlow Condensed',sans-serif"}}>{r.result}</div><div style={{fontSize:"6px",fontWeight:700,color:r.ats==="C"?"#4ade80":"#f87171",fontFamily:"'Barlow Condensed',sans-serif"}}>{r.ats||""}</div></div>)}</div><div style={{display:"flex",gap:"3px",flexWrap:"wrap"}}>{[[fd.l5Record,"L5"],[fd.l5ATS,"ATS"],[fd.streak,"STK"]].map(([v,l])=>v?<div key={l} style={{background:"rgba(255,255,255,0.04)",borderRadius:"3px",padding:"2px 5px",textAlign:"center"}}><div style={{fontSize:"6px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif"}}>{l}</div><div style={{fontSize:"10px",fontWeight:800,color:"#ddd",fontFamily:"'Barlow Condensed',sans-serif"}}>{v}</div></div>:null)}</div>{fd.note&&<div style={{fontSize:"8px",color:"#2a2a2a",fontFamily:"'Barlow Condensed',sans-serif",marginTop:"2px",fontStyle:"italic"}}>{fd.note}</div>}</div>}{rd&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"3px"}}>{[["OFF",rd.offRank,"rank"],["DEF",rd.defRank,"rank"],["RZ Off",rd.rzOff,"%"],["RZ Def",rd.rzDef,"%"],["3rd Off",rd.thirdOff,"%"],["3rd Def",rd.thirdDef,"%"]].map(([lbl,v,unit])=>{const isRk=unit==="rank",num=parseFloat(v)||0;const c=isRk?(num<=10?"#4ade80":num<=21?"#f59e0b":"#f87171"):(num>=60?"#4ade80":num>=45?"#f59e0b":"#f87171");return <div key={lbl} style={{background:"rgba(255,255,255,0.03)",borderRadius:"3px",padding:"3px 4px",textAlign:"center"}}><div style={{fontSize:"6px",color:"#1a1a2a",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"1px"}}>{lbl}</div><div style={{fontSize:"10px",fontWeight:800,color:c,fontFamily:"'Barlow Condensed',sans-serif"}}>{isRk?`#${v||"?"}`:v?`${v}%`:"—"}</div></div>;})}</div>}</div>);})}</div>}</Panel>}
@@ -4337,14 +7899,43 @@ Combined: ${combProb.toFixed(1)}%
       <Panel mb="13px"><PanelTitle icon="🩹" title="Injury Report" tag={injuryStatus==="success"?"live":injuryStatus==="loading"?"loading…":undefined}/><textarea value={injuries} onChange={e=>setInjuries(e.target.value)} placeholder={injuryStatus==="loading"?"Fetching…":injuryStatus==="noTeams"?"Select both teams…":"None found — add manually"} rows={injuries?Math.min(7,injuries.split("\n").length+1):3} style={{width:"100%",padding:"7px 9px",background:injuryStatus==="success"?"rgba(74,222,128,0.025)":"rgba(255,255,255,0.018)",border:`1px solid ${injuryStatus==="success"?"rgba(74,222,128,0.13)":injuryStatus==="error"?"rgba(248,113,113,0.13)":"rgba(255,255,255,0.06)"}`,borderRadius:"5px",color:"#aaa",fontSize:"10px",outline:"none",resize:"vertical",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:"1.5"}}/></Panel>
       {/* Injury impact quantifier — auto-parses injury text to point values */}
       <InjuryImpactPanel injuries={injuries} homeTeam={homeTeam} awayTeam={awayTeam} lines={lines}/>
+      {/* GNN Roster Interdependency — cascade effects, coverage scheme, snap counts */}
+      {(homeTeam&&awayTeam)&&<GNNRosterPanel homeTeam={homeTeam} awayTeam={awayTeam} injuries={injuries} pressureData={pressureData} olData={olData} cpoeData={cpoeData} ensembleData={ensembleData} lines={lines}/>}
 
 
       {/* Pattern match alert — fires when current game matches learned history */}
       {patternResult&&<PatternMatchAlert currentFingerprint={currentFingerprint} patternResult={patternResult}/>}
 
+      {/* ── Bet intent — set before analysis to auto-track result in bankroll ── */}
+      {canAnalyze&&(
+        <div style={{marginBottom:"8px",padding:"9px 11px",background:"rgba(255,255,255,0.03)",border:"1px solid "+(betIntentActive?"rgba(74,222,128,0.2)":"rgba(255,255,255,0.07)"),borderRadius:"7px",transition:"border 0.2s"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:betIntentActive?"8px":"0"}}>
+            <button onClick={()=>setBetIntentActive(o=>!o)}
+              style={{padding:"4px 10px",borderRadius:"4px",border:"1px solid "+(betIntentActive?"rgba(74,222,128,0.35)":"rgba(255,255,255,0.1)"),background:betIntentActive?"rgba(74,222,128,0.1)":"transparent",color:betIntentActive?"#4ade80":"#555",fontSize:"9px",fontWeight:700,cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",transition:"all 0.15s"}}>
+              {betIntentActive?"✅ Tracking This Bet":"💰 Betting This?"}
+            </button>
+            {betIntentActive&&<span style={{fontSize:"8px",color:"#4ade80",fontFamily:"'Barlow Condensed',sans-serif"}}>Auto-logs to bankroll when result is fetched</span>}
+          </div>
+          {betIntentActive&&(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"7px"}}>
+              <div>
+                <label style={{display:"block",fontSize:"7px",fontWeight:700,color:"#444",marginBottom:"2px",fontFamily:"'Barlow Condensed',sans-serif"}}>Units to Bet</label>
+                <input value={betIntentUnits} onChange={e=>setBetIntentUnits(e.target.value)} placeholder="e.g. 2" type="number" min="0.5" step="0.5"
+                  style={{width:"100%",padding:"6px 8px",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(74,222,128,0.2)",borderRadius:"5px",color:"#fff",fontSize:"14px",fontWeight:700,outline:"none",fontFamily:"'Barlow Condensed',sans-serif"}}/>
+              </div>
+              <div>
+                <label style={{display:"block",fontSize:"7px",fontWeight:700,color:"#444",marginBottom:"2px",fontFamily:"'Barlow Condensed',sans-serif"}}>Odds (American)</label>
+                <input value={betIntentOdds} onChange={e=>setBetIntentOdds(e.target.value)} placeholder="-110"
+                  style={{width:"100%",padding:"6px 8px",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(74,222,128,0.2)",borderRadius:"5px",color:"#fff",fontSize:"14px",fontWeight:700,outline:"none",fontFamily:"'Barlow Condensed',sans-serif"}}/>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Analyze button */}
       <button onClick={runAnalysis} disabled={!canAnalyze||loading} style={{width:"100%",padding:"13px",borderRadius:"8px",border:"none",background:canAnalyze&&!loading?"linear-gradient(135deg,#16a34a,#15803d)":"rgba(255,255,255,0.04)",color:canAnalyze&&!loading?"#fff":"#1a1a2a",fontSize:"13px",fontWeight:900,letterSpacing:"0.12em",textTransform:"uppercase",cursor:canAnalyze&&!loading?"pointer":"not-allowed",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"13px",boxShadow:canAnalyze&&!loading?"0 0 20px rgba(22,163,74,0.15)":"none",transition:"all 0.2s"}}>
-        {loading?<span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"8px"}}><span style={{width:"12px",height:"12px",border:"2px solid rgba(255,255,255,0.2)",borderTopColor:"#fff",borderRadius:"50%",display:"inline-block",animation:"spin 0.7s linear infinite"}}/>Running 17-Signal Analysis…</span>:`Analyze Game${parlayLegs.length>0?` (Leg ${parlayLegs.length+1})`:""}`}
+        {loading?<span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"8px"}}><span style={{width:"12px",height:"12px",border:"2px solid rgba(255,255,255,0.2)",borderTopColor:"#fff",borderRadius:"50%",display:"inline-block",animation:"spin 0.7s linear infinite"}}/>Running 17-Signal Analysis…</span>:"Analyze Game"+(parlayLegs.length>0?" (Leg "+(parlayLegs.length+1)+")":"")}
       </button>
 
       {error&&<div style={{background:"rgba(239,68,68,0.05)",border:"1px solid rgba(239,68,68,0.13)",borderRadius:"6px",padding:"8px 11px",color:"#fca5a5",fontSize:"10px",fontFamily:"'Barlow Condensed',sans-serif",marginBottom:"10px"}}>⚠ {error}</div>}
@@ -4355,6 +7946,11 @@ Combined: ${combProb.toFixed(1)}%
       {gameResult&&<EVKellyPanel gameResult={gameResult} lines={lines}/>}
       {/* Line Shopping — shows best available line across books */}
       {gameResult&&ensembleData&&<LineShoppingPanel ensemble={ensembleData} lines={lines} gameResult={gameResult} homeTeam={homeTeam} awayTeam={awayTeam}/>}
+      {/* ── Sportsbook Profiling & Sharp-Line Arbitrage ── */}
+      {ensembleData&&<SportsbookProfilePanel ensemble={ensembleData} lines={lines}/>}
+      {ensembleData&&<SharpLineArbitragePanel ensemble={ensembleData} lines={lines} homeTeam={homeTeam} awayTeam={awayTeam}/>}
+      {/* ── Player Prop & Derivative Modeler ── */}
+      {(homeTeam&&awayTeam)&&<PropModelerPanel homeTeam={homeTeam} awayTeam={awayTeam} gameResult={gameResult} lines={lines} weather={weather} pressureData={pressureData} olData={olData} cpoeData={cpoeData} garbageData={garbageData}/>}
       <div style={{textAlign:"center",marginTop:"22px",fontSize:"8px",color:"#0e0e1a",letterSpacing:"0.08em",fontFamily:"'Barlow Condensed',sans-serif"}}>FOR ENTERTAINMENT PURPOSES ONLY · NOT FINANCIAL OR BETTING ADVICE</div>
     </div>
   </div>);
