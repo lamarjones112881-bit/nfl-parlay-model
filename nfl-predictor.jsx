@@ -5766,7 +5766,6 @@ Be specific with real data. If a game is unavailable or lines aren't posted yet,
 
           {/* Action buttons */}
           <div style={{display:"flex",gap:"7px"}}>
-            <div style={{display:"flex",gap:"7px"}}>
             <button onClick={()=>onLoadMatchup(p.away,p.home)} style={{flex:1,padding:"10px",borderRadius:"7px",border:"none",background:"linear-gradient(135deg,#16a34a,#15803d)",color:"#fff",fontSize:"11px",fontWeight:800,letterSpacing:"0.08em",textTransform:"uppercase",cursor:"pointer",fontFamily:"'Barlow Condensed',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:"6px"}}>
               🔍 Load Full 17-Signal Analysis
             </button>
